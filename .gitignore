@@ -1,0 +1,7 @@
+/bin/
+/dist/
+.env
+*.local
+# sandbox-only module overrides
+go.work
+go.work.sum

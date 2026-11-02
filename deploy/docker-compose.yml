@@ -1,0 +1,38 @@
+# Single-host deployment: the service and its PostgreSQL, next to Open WebUI on the shared "llm" network.
+# TLS termination and the public name (PUBLIC_URL) are provided by the reverse proxy.
+services:
+  atlassian-mcp:
+    image: atlassian-mcp:${VERSION:-dev}
+    build:
+      context: ..
+      args:
+        VERSION: ${VERSION:-dev}
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8082:8080"   # behind the reverse proxy
+    # - "9090:9090" # metrics; expose only to Prometheus
+    volumes:
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+    networks: [llm, default]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: amcp
+      POSTGRES_USER: amcp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - /data/atlassian-mcp/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U amcp -d amcp"]
+      interval: 5s
+      retries: 10
+
+networks:
+  llm:
+    external: true

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мои доступы — Atlassian MCP</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2330; --muted:#667085; --line:#e4e7ec; --accent:#2457d6; --ok:#14804a; --warn:#b42318; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111418; --card:#1a1f26; --text:#e6e9ef; --muted:#98a2b3; --line:#2b323c; --accent:#7aa2ff; --ok:#4cc38a; --warn:#ff8a7a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 48px; }
+  header { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:20px; }
+  h1 { font-size:22px; margin:0; } h2 { font-size:17px; margin:0 0 12px; }
+  .muted { color:var(--muted); font-size:13px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; margin-bottom:16px; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 0; border-top:1px solid var(--line); }
+  .row:first-of-type { border-top:0; }
+  .ok { color:var(--ok); } .off { color:var(--muted); } .warn { color:var(--warn); }
+  button, .btn { font:inherit; padding:6px 14px; border-radius:7px; border:1px solid var(--line); background:var(--card); color:var(--text); cursor:pointer; text-decoration:none; display:inline-block; }
+  .primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .notice { padding:10px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); margin-bottom:16px; }
+  code, .key { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px; word-break:break-all; }
+  .key { display:block; padding:10px; border:1px dashed var(--accent); border-radius:8px; margin:8px 0; user-select:all; }
+  form.inline { display:inline; margin:0; }
+  .new { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:12px; }
+  input { font:inherit; padding:6px 10px; border-radius:7px; border:1px solid var(--line); background:var(--bg); color:var(--text); }
+  input[type=number] { width:90px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Мои доступы</h1>
+      <div class="muted">{{.User}}</div>
+    </div>
+    <form class="inline" method="post" action="/logout">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit">Выйти</button>
+    </form>
+  </header>
+
+  {{with .Message}}<div class="notice">{{.}}</div>{{end}}
+
+  {{with .NewKey}}
+  <section>
+    <h2>Новый ключ создан</h2>
+    <p class="warn">Скопируйте ключ сейчас — повторно его показать нельзя.</p>
+    <span class="key">{{.}}</span>
+    <p class="muted">Ключ даёт агенту ваши права в Confluence и Jira. Не передавайте его другим и храните как пароль.</p>
+  </section>
+  {{end}}
+
+  <section>
+    <h2>Confluence и Jira</h2>
+    <p class="muted">Ассистенты и агенты видят только то, что видите вы сами. Доступ можно отключить в любой момент.</p>
+    {{range .Providers}}
+    <div class="row">
+      <div>
+        <strong>{{.Title}}</strong><br>
+        {{if .Connected}}<span class="ok">Подключено</span>{{else}}<span class="off">Не подключено</span>{{end}}
+      </div>
+      {{if .Connected}}
+      <form class="inline" method="post" action="/disconnect/{{.ID}}">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <button type="submit">Отключить</button>
+      </form>
+      {{else}}
+      <a class="btn primary" href="/connect/{{.ID}}">Разрешить доступ</a>
+      {{end}}
+    </div>
+    {{end}}
+  </section>
+
+  <section>
+    <h2>Ключи для агентов</h2>
+    <p class="muted">Для OpenCode и своих скриптов. Адрес MCP-сервера: <code>{{.MCPURL}}</code>, ключ передаётся в заголовке <code>Authorization: Bearer &lt;ключ&gt;</code>.</p>
+    {{range .Keys}}
+    <div class="row">
+      <div>
+        <strong>{{.Name}}</strong> <span class="muted">· {{.ID}}</span><br>
+        <span class="muted">создан {{date .CreatedAt}} · действует до {{date .ExpiresAt}} · использован {{datetimep .LastUsedAt}}</span>
+      </div>
+      {{if .Active}}
+      <form class="inline" method="post" action="/keys/{{.ID}}/revoke">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <button type="submit">Отозвать</button>
+      </form>
+      {{else}}<span class="off">{{if .RevokedAt}}отозван{{else}}истёк{{end}}</span>{{end}}
+    </div>
+    {{else}}
+    <p class="muted">Ключей нет.</p>
+    {{end}}
+    <form class="new" method="post" action="/keys">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input name="name" placeholder="Название, например «OpenCode на ноутбуке»" maxlength="64" required size="36">
+      <label class="muted">дней <input type="number" name="days" min="1" max="{{.MaxTTL}}" value="{{.DefaultTTL}}"></label>
+      <button class="primary" type="submit">Создать ключ</button>
+    </form>
+  </section>
+</main>
+</body>
+</html>
