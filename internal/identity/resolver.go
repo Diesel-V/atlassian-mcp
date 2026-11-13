@@ -25,13 +25,22 @@ type Resolver struct {
 	Agents      store.Agents
 	UserClients []string // azp values accepted as end-user tokens
 	StripDomain string   // removed from usernames: alice@example.com -> alice
-	Now         func() time.Time
-	Log         *slog.Logger
+	// RequiredGroup, if set, admits only users in this Keycloak group (pilot group).
+	RequiredGroup string
+	// DisableAPIKeys and DisableAgents switch the agent access paths off
+	// (the pilot allows access through Open WebUI only).
+	DisableAPIKeys bool
+	DisableAgents  bool
+	Now            func() time.Time
+	Log            *slog.Logger
 }
 
 // Resolve authenticates a raw bearer token.
 func (r *Resolver) Resolve(ctx context.Context, raw string) (Subject, time.Time, error) {
 	if strings.HasPrefix(raw, APIKeyPrefix) {
+		if r.DisableAPIKeys {
+			return Subject{}, time.Time{}, auth.ErrInvalidToken
+		}
 		return r.resolveKey(ctx, raw)
 	}
 	return r.resolveJWT(ctx, raw)
@@ -79,7 +88,13 @@ func (r *Resolver) resolveJWT(ctx context.Context, raw string) (Subject, time.Ti
 		if user == "" || strings.HasPrefix(user, "service-account-") {
 			return Subject{}, time.Time{}, auth.ErrInvalidToken
 		}
+		if !InGroup(c.Groups, r.RequiredGroup) {
+			return Subject{}, c.Expiry, ErrForbidden
+		}
 		return Subject{Kind: KindUser, Username: user}, c.Expiry, nil
+	}
+	if r.DisableAgents {
+		return Subject{}, c.Expiry, ErrForbidden
 	}
 	a, err := r.Agents.GetAgent(ctx, c.AuthorizedParty)
 	if errors.Is(err, store.ErrNotFound) || (err == nil && !a.Enabled) {
@@ -91,8 +106,9 @@ func (r *Resolver) resolveJWT(ctx context.Context, raw string) (Subject, time.Ti
 	return Subject{Kind: KindAgent, AgentID: a.ClientID}, c.Expiry, nil
 }
 
-// ErrForbidden means the token is valid but its client is not allowed to use the service.
-var ErrForbidden = errors.New("identity: client not registered")
+// ErrForbidden means the token is valid but its owner is not allowed to use the
+// service: an unregistered or disabled client, or a user outside the required group.
+var ErrForbidden = errors.New("identity: not allowed")
 
 // NormalizeUsername lower-cases and strips the configured e-mail domain.
 func NormalizeUsername(name, stripDomain string) string {

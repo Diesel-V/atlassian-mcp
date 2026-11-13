@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -13,6 +14,7 @@ import (
 type Claims struct {
 	AuthorizedParty string    // azp: the Keycloak client that obtained the token
 	Username        string    // value of the configured username claim
+	Groups          []string  // value of the configured groups claim (Keycloak group mapper)
 	Expiry          time.Time // exp
 }
 
@@ -25,10 +27,11 @@ type TokenVerifier interface {
 type KeycloakVerifier struct {
 	verifier      *oidc.IDTokenVerifier
 	usernameClaim string
+	groupsClaim   string
 }
 
 // NewKeycloakVerifier discovers the realm at issuer. httpClient may carry a corporate CA.
-func NewKeycloakVerifier(ctx context.Context, issuer, usernameClaim string, httpClient *http.Client) (*KeycloakVerifier, error) {
+func NewKeycloakVerifier(ctx context.Context, issuer, usernameClaim, groupsClaim string, httpClient *http.Client) (*KeycloakVerifier, error) {
 	if httpClient != nil {
 		ctx = oidc.ClientContext(ctx, httpClient)
 	}
@@ -38,7 +41,7 @@ func NewKeycloakVerifier(ctx context.Context, issuer, usernameClaim string, http
 	}
 	// Access tokens carry aud=account, so the audience is checked through azp instead.
 	v := provider.Verifier(&oidc.Config{SkipClientIDCheck: true})
-	return &KeycloakVerifier{verifier: v, usernameClaim: usernameClaim}, nil
+	return &KeycloakVerifier{verifier: v, usernameClaim: usernameClaim, groupsClaim: groupsClaim}, nil
 }
 
 // Verify implements TokenVerifier.
@@ -53,5 +56,37 @@ func (k *KeycloakVerifier) Verify(ctx context.Context, raw string) (*Claims, err
 	}
 	azp, _ := all["azp"].(string)
 	user, _ := all[k.usernameClaim].(string)
-	return &Claims{AuthorizedParty: azp, Username: user, Expiry: tok.Expiry}, nil
+	return &Claims{AuthorizedParty: azp, Username: user, Groups: StringList(all[k.groupsClaim]), Expiry: tok.Expiry}, nil
+}
+
+// StringList reads a JSON claim that holds a list of strings (or a single string).
+func StringList(v any) []string {
+	switch t := v.(type) {
+	case string:
+		return []string{t}
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, x := range t {
+			if s, ok := x.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// InGroup reports whether groups contains required. Keycloak sends groups either
+// as names or as full paths ("/ai/pilot"); a leading slash is ignored on both sides.
+func InGroup(groups []string, required string) bool {
+	required = strings.TrimPrefix(strings.TrimSpace(required), "/")
+	if required == "" {
+		return true
+	}
+	for _, g := range groups {
+		if strings.TrimPrefix(strings.TrimSpace(g), "/") == required {
+			return true
+		}
+	}
+	return false
 }

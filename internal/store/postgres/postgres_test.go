@@ -3,9 +3,12 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"errors"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"atlassian-mcp/internal/crypto"
 	"atlassian-mcp/internal/store"
@@ -83,5 +86,123 @@ func TestSecretsAreEncryptedAtRest(t *testing.T) {
 	}
 	if _, err := s.GetToken(ctx, "mallory", store.Confluence); err == nil {
 		t.Fatal("token copied to another user decrypted successfully")
+	}
+}
+
+func TestAuditObjectsSearchable(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	for _, objs := range [][]string{{"12345", "OD-1"}, nil} {
+		if err := s.InsertAudit(ctx, &store.AuditEntry{Time: time.Now(), Tool: "t", Principal: "alice", Objects: objs}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var who string
+	var n int
+	if err := s.pool.QueryRow(ctx, `SELECT principal, count(*) OVER () FROM audit_log WHERE '12345' = ANY(objects)`).Scan(&who, &n); err != nil {
+		t.Fatal(err)
+	}
+	if who != "alice" || n != 1 {
+		t.Fatalf("lookup by object: %s %d", who, n)
+	}
+	var empty int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE objects = '{}'`).Scan(&empty); err != nil || empty != 1 {
+		t.Fatalf("nil objects stored as %d empty arrays, err %v", empty, err)
+	}
+}
+
+func TestCheckSchema(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if err := s.CheckSchema(ctx); err != nil {
+		t.Fatalf("fresh schema: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM schema_migrations WHERE version = (SELECT max(version) FROM schema_migrations)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckSchema(ctx); !errors.Is(err, ErrSchemaOutdated) {
+		t.Fatalf("pending migration: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `DROP TABLE schema_migrations`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckSchema(ctx); !errors.Is(err, ErrSchemaOutdated) {
+		t.Fatalf("never migrated: %v", err)
+	}
+}
+
+// TestLeastPrivilegeRoles applies deploy/postgres-roles.sql and checks that the
+// runtime role works but cannot change the schema.
+func TestLeastPrivilegeRoles(t *testing.T) {
+	admin := openTest(t)
+	ctx := context.Background()
+	exec := func(st *Store, q string) error { _, err := st.pool.Exec(ctx, q); return err }
+
+	cleanup := func() {
+		for _, q := range []string{
+			`DROP TABLE IF EXISTS oauth_tokens, api_keys, agents, audit_log, schema_migrations`,
+			`DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='amcp_app') THEN DROP OWNED BY amcp_app; DROP ROLE amcp_app; END IF; END $$`,
+			`DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='amcp_migrator') THEN DROP OWNED BY amcp_migrator; DROP ROLE amcp_migrator; END IF; END $$`,
+		} {
+			if err := exec(admin, q); err != nil {
+				t.Fatalf("cleanup: %v", err)
+			}
+		}
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	sql, err := os.ReadFile("../../../deploy/postgres-roles.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{string(sql), `ALTER ROLE amcp_migrator PASSWORD 'm'`, `ALTER ROLE amcp_app PASSWORD 'a'`} {
+		if err := exec(admin, q); err != nil {
+			t.Fatalf("roles: %v", err)
+		}
+	}
+
+	as := func(user, pass string) *Store {
+		u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.User = url.UserPassword(user, pass)
+		sealer, _ := crypto.NewSealer(bytes.Repeat([]byte{7}, 32))
+		st, err := Open(ctx, u.String(), sealer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(st.Close)
+		return st
+	}
+	migrator, app := as("amcp_migrator", "m"), as("amcp_app", "a")
+
+	if err := app.Migrate(ctx); err == nil {
+		t.Fatal("runtime role created the schema")
+	}
+	if err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("migrator: %v", err)
+	}
+	if err := app.CheckSchema(ctx); err != nil {
+		t.Fatalf("runtime role cannot read the schema version: %v", err)
+	}
+
+	if err := app.PutToken(ctx, &store.OAuthToken{Username: "alice", Provider: store.Jira, AccessToken: "a", RefreshToken: "r"}); err != nil {
+		t.Fatalf("runtime write: %v", err)
+	}
+	if _, err := app.GetToken(ctx, "alice", store.Jira); err != nil {
+		t.Fatalf("runtime read: %v", err)
+	}
+	if err := app.InsertAudit(ctx, &store.AuditEntry{Time: time.Now().Add(-48 * time.Hour), Tool: "t"}); err != nil {
+		t.Fatalf("runtime audit: %v", err)
+	}
+	if n, err := app.PurgeAudit(ctx, time.Now().Add(-time.Hour)); err != nil || n != 1 {
+		t.Fatalf("runtime retention: %d %v", n, err)
+	}
+	for _, ddl := range []string{`CREATE TABLE evil (x int)`, `DROP TABLE audit_log`, `ALTER TABLE audit_log DROP COLUMN error`, `TRUNCATE audit_log`} {
+		if err := exec(app, ddl); err == nil {
+			t.Errorf("runtime role was allowed: %s", ddl)
+		}
 	}
 }

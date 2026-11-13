@@ -50,69 +50,105 @@ OpenCode / скрипт ─────────(персональный к�
 | `GET /healthz`, `GET /readyz` | liveness / readiness (проверка БД) |
 | `:9090/` | Метрики Prometheus (отдельный порт, наружу не публиковать): `amcp_tool_calls_total`, `amcp_tool_duration_seconds`, `amcp_connected_users` |
 
+## Режим пилота (требования ИБ)
+
+Пилот согласован на условиях: только поиск и чтение, только согласованные пространства и проекты, только пилотная группа и только через Open WebUI. Сервер обеспечивает это сам, независимо от прав сотрудника в продукте:
+
+| Требование | Как обеспечено |
+|---|---|
+| Только согласованные пространства и проекты | `CONFLUENCE_ALLOWED_SPACES`, `JIRA_ALLOWED_PROJECTS` — обязательны. Ограничение вставляется в каждый CQL/JQL; страница или задача, открытая по ID или ссылке, проверяется после получения (в том числе перенесённая задача); результаты вне списка отбрасываются. Свободный JQL при ограниченном списке проектов отключён |
+| Только пилотная группа | `KEYCLOAK_REQUIRED_GROUP`: остальные получают 403 и не могут войти на страницу «Мои доступы» |
+| Только через Open WebUI | `ENABLE_API_KEYS=false`, `ENABLE_AGENTS=false` (по умолчанию): ключи отклоняются (401), агенты — 403, раздел ключей скрыт |
+| Только чтение | Инструментов записи нет; OAuth-гранты со scope READ |
+| TLS до ВМ | `TLS_CERT_FILE` / `TLS_KEY_FILE`, минимум TLS 1.2 |
+| Секреты в Vault | Любая переменная читается из файла `<ИМЯ>_FILE` (Vault Agent) |
+| Минимальные права в БД | `deploy/postgres-roles.sql`: рабочая роль без DDL, миграции — отдельной ролью; `MIGRATE_ON_START=false` |
+| Аудит | Пользователь, инструмент, параметры, ID найденных и открытых объектов, статус (`out_of_scope` для отказов по списку). Без токенов, кодов и текста документов |
+| Поставка | Образ собирается и проверяется в CI (`.gitlab-ci.yml`: тесты с PostgreSQL, govulncheck, Trivy), запускается из внутреннего реестра без root, с read-only FS, без capabilities |
+
 ## Конфигурация
 
-Все параметры задаются переменными окружения, полный пример лежит в `deploy/.env.example`. Обязательные:
+Все параметры задаются переменными окружения, полный пример для пилота — `deploy/.env.example` (его корректность проверяется тестом). Любую переменную можно передать файлом через `<ИМЯ>_FILE`. Обязательные:
 
 | Переменная | Описание |
 |---|---|
 | `PUBLIC_URL` | Внешний HTTPS-адрес сервиса (на него возвращаются OAuth-редиректы) |
-| `DATABASE_URL` | PostgreSQL |
+| `DATABASE_URL` | PostgreSQL, рабочая роль |
 | `ENCRYPTION_KEY` | 32 байта в base64, шифрует токены и PAT в БД (`openssl rand -base64 32`). Если его потерять, все гранты станут недействительны |
 | `SESSION_KEY` | 32 байта в base64, защищает cookie страницы «Мои доступы» |
 | `KEYCLOAK_ISSUER` | Например `https://auth.example.com/realms/<realm>` |
 | `KEYCLOAK_WEB_CLIENT_ID` / `_SECRET` | Конфиденциальный клиент для страницы «Мои доступы» |
-| `CONFLUENCE_URL` / `_CLIENT_ID` / `_CLIENT_SECRET` | Входящая ссылка на приложение в Confluence (можно не задавать, если Confluence не нужен) |
-| `JIRA_URL` / `_CLIENT_ID` / `_CLIENT_SECRET` | То же для Jira |
+| `CONFLUENCE_URL` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_ALLOWED_SPACES` | Входящая ссылка на приложение в Confluence и разрешённые пространства (`*` — все) |
+| `JIRA_URL` / `_CLIENT_ID` / `_CLIENT_SECRET` / `_ALLOWED_PROJECTS` | То же для Jira |
 
-Должен быть задан хотя бы один из продуктов.
-
-Необязательные параметры с умолчаниями (сроки ключей, лимиты, таймауты, `AUDIT_RETENTION=8760h` — срок хранения аудита, `0` хранит вечно) перечислены в `deploy/.env.example`.
+Должен быть задан хотя бы один из продуктов. Пилотные параметры (`KEYCLOAK_REQUIRED_GROUP`, `ENABLE_*`, `TLS_*`, `MIGRATE_*`) и необязательные с умолчаниями (сроки ключей, лимиты, таймауты, `AUDIT_RETENTION`) — в `deploy/.env.example`.
 
 ## Что нужно настроить в смежных системах
 
 **Confluence и Jira** (администраторы, отдельно в каждом продукте): *Администрирование → Ссылки на приложения → Создать ссылку → Внешнее приложение → Входящая*.
-- Redirect URL: `https://mcp-atlassian.example.com/oauth/confluence/callback` (для Jira — `/oauth/jira/callback`)
-- Права: **Read** (запись в Jira появится в отдельной фазе)
-- Результат: Client ID и Client Secret передаются в `CONFLUENCE_*` / `JIRA_*`
+- Redirect URL: `${PUBLIC_URL}/oauth/confluence/callback` (для Jira — `/oauth/jira/callback`)
+- Права: **Read**
+- Результат: Client ID и Client Secret (секрет — в Vault)
 
 **Keycloak** (realm, которому доверяет Open WebUI):
-- Конфиденциальный клиент `atlassian-mcp`, Standard flow, redirect URI `https://mcp-atlassian.example.com/login/callback`, PKCE S256.
-- Для каждого автономного агента — отдельный клиент со Service accounts enabled. Его `client_id` регистрируется командой `agent add`.
+- Конфиденциальный клиент `atlassian-mcp`, Standard flow, redirect URI `${PUBLIC_URL}/login/callback`, PKCE S256.
+- Группа пилота и mapper «Group Membership» (claim `groups`) в access-токене клиента `open-webui` и в ID-токене клиента `atlassian-mcp`.
+- Срок жизни access-токена — минуты, не сутки.
 
-**DNS/TLS**: имя `mcp-atlassian.example.com` с TLS через reverse proxy на порт 8082 сервера. Адрес должен открываться из браузеров сотрудников.
+**Сеть** (отдельный VLAN, по умолчанию всё закрыто):
+- Reverse proxy публикует `PUBLIC_URL` по HTTPS. Через VPN сотрудникам открыты только пути входа и подключения: `/`, `/login`, `/login/callback`, `/logout`, `/connect/*`, `/oauth/*/callback`, `/disconnect/*`. Путь `/mcp` — только с сервера Open WebUI. `/healthz`, `/readyz` — мониторинг.
+- Порт 8082 (TLS) — только с reverse proxy; SSH — только с jump host; порт метрик 9090 — только система мониторинга.
+- Исходящие с ВМ: Confluence, Jira, Keycloak, PostgreSQL, Vault, внутренний реестр. Публичные репозитории закрыты.
 
-## Развёртывание (один хост, Docker Compose)
+**Vault**: секреты `database_url`, `encryption_key`, `session_key`, `keycloak_web_client_secret`, `confluence_client_secret`, `jira_client_secret`. Vault Agent кладёт их в `/run/atlassian-mcp/secrets/` (файлы `0400`, владелец uid `65532`).
+
+**PostgreSQL** (штатный кластер, штатные бэкапы): DBA выполняет `deploy/postgres-roles.sql` в БД сервиса и задаёт пароли ролям `amcp_migrator` и `amcp_app`.
+
+## Развёртывание
+
+Образ собирает CI и публикует во внутренний реестр. На ВМ ничего не собирается:
 
 ```bash
-cd deploy
-cp .env.example .env && chmod 600 .env     # заполнить секреты
-echo "POSTGRES_PASSWORD=..." >> .env        # тот же пароль, что в DATABASE_URL
-docker compose up -d --build
-curl -s localhost:8082/readyz               # 200 — готово
+cd /opt/atlassian-mcp      # docker-compose.yml из deploy/
+export REGISTRY_IMAGE=<реестр>/ai/atlassian-mcp VERSION=<тег>
+docker compose --profile migrate run --rm migrate   # схема, роль amcp_migrator
+docker compose up -d
+curl -sk https://localhost:8082/readyz              # 200 — готово
 ```
 
-При старте сервис сам применяет миграции, отдельно их запускать не нужно (`atlassian-mcp migrate` есть для CI и ручного запуска).
+Сервис работает под ролью `amcp_app` и при `MIGRATE_ON_START=false` только проверяет, что схема актуальна: если миграции не применены, он не стартует и пишет об этом в лог. После настройки временный sudo и членство в группе docker отзываются; кто выкатывает обновления после этого — открытый вопрос спецификации.
 
 ### Подключение в Open WebUI
 
 *Настройки → Admin → Внешние инструменты → Добавить подключение*:
 - Тип: **MCP (Streamable HTTP)**
-- URL: `http://atlassian-mcp:8080/mcp` (контейнеры в общей сети `llm`)
+- URL: `${PUBLIC_URL}/mcp`
 - Авторизация: **OAuth** (Open WebUI передаёт SSO-токен пользователя)
 
-Затем создать модель «Atlassian» на self-hosted модели с поддержкой function calling, включить в ней этот инструмент, режим вызова функций — Native, остальные встроенные инструменты выключить.
+Модель «Atlassian» — на self-hosted LLM, режим вызова функций Native, подключён только этот инструмент. Для пилота дополнительно:
+- у модели выключены веб-поиск, загрузка URL, генерация изображений и встроенные инструменты отправки наружу (автоматизации, уведомления, создание инструментов);
+- модель задач (заголовки, теги) — self-hosted;
+- публикация и общий доступ к чатам выключены, `ENABLE_ADMIN_CHAT_ACCESS=false`;
+- в шлюзе LiteLLM кешируются только эмбеддинги.
+
+### Отключение MCP
+
+От быстрого к полному:
+1. Выключить инструмент в Open WebUI — модели перестают его вызывать.
+2. `docker compose stop atlassian-mcp` — сервис недоступен.
+3. Отключить входящую ссылку на приложение в Confluence/Jira — продукт перестаёт принимать все выданные токены.
+4. `atlassian-mcp user offboard -username X` — для одного человека (ключи и гранты).
 
 ### OpenCode
 
-На странице «Мои доступы» выпустить ключ, затем в `opencode.json`:
+Вне пилота (`ENABLE_API_KEYS=true`). На странице «Мои доступы» выпустить ключ, затем в `opencode.json`:
 
 ```json
 {
   "mcp": {
     "atlassian": {
       "type": "remote",
-      "url": "https://mcp-atlassian.example.com/mcp",
+      "url": "https://atlassian-mcp.example.com/mcp",
       "headers": { "Authorization": "Bearer {env:ATLASSIAN_MCP_KEY}" }
     }
   }
@@ -120,6 +156,8 @@ curl -s localhost:8082/readyz               # 200 — готово
 ```
 
 ### Автономные агенты
+
+Вне пилота (`ENABLE_AGENTS=true`).
 
 ```bash
 docker compose exec atlassian-mcp /atlassian-mcp agent add -client-id ticket-bot -name "Разбор тикетов" -owner p.petrov
@@ -167,6 +205,7 @@ internal/identity      кто вызывает: Keycloak JWT, персональ
 internal/atlassian     HTTP, OAuth 2.0 с Data Center, учётные данные субъекта, экранирование
   confluence/ jira/    клиенты и сборка CQL/JQL
 internal/tools         MCP-инструменты
+internal/scope         белый список пространств и проектов
 internal/audit         аудит и срок его хранения
 internal/offboard      отзыв доступа человека
 internal/metrics       метрики Prometheus

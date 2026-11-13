@@ -56,13 +56,16 @@ type Config struct {
 	SessionTTL    time.Duration
 	APIKeyDefault time.Duration
 	APIKeyMax     time.Duration
-	Login         LoginProvider
-	Connectors    map[store.Provider]Connector
-	Grants        GrantSaver
-	Tokens        store.Tokens
-	Keys          store.APIKeys
-	Log           *slog.Logger
-	Now           func() time.Time
+	// DisableAPIKeys hides the agent keys section and refuses to issue keys
+	// (the pilot allows access through Open WebUI only).
+	DisableAPIKeys bool
+	Login          LoginProvider
+	Connectors     map[store.Provider]Connector
+	Grants         GrantSaver
+	Tokens         store.Tokens
+	Keys           store.APIKeys
+	Log            *slog.Logger
+	Now            func() time.Time
 }
 
 // Handler serves the web UI.
@@ -188,6 +191,11 @@ func (h *Handler) loginCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, err := h.cfg.Login.Exchange(r.Context(), r.URL.Query().Get("code"), f.Verifier, f.Nonce)
+	if errors.Is(err, identity.ErrForbidden) {
+		h.cfg.Log.Warn("web login outside the required group")
+		http.Error(w, "Доступ открыт только участникам пилота", http.StatusForbidden)
+		return
+	}
 	if err != nil {
 		h.cfg.Log.Warn("login exchange failed", "err", err)
 		http.Error(w, "Не удалось выполнить вход", http.StatusUnauthorized)
@@ -308,6 +316,10 @@ func (h *Handler) disconnect(w http.ResponseWriter, r *http.Request, s session) 
 // --- personal keys ---
 
 func (h *Handler) createKey(w http.ResponseWriter, r *http.Request, s session) {
+	if h.cfg.DisableAPIKeys {
+		http.NotFound(w, r)
+		return
+	}
 	name := strings.TrimSpace(r.PostFormValue("name"))
 	if name == "" || utf8.RuneCountInString(name) > 64 {
 		h.back(w, r, "badname")
@@ -388,15 +400,16 @@ type keyView struct {
 }
 
 type pageData struct {
-	User       string
-	CSRF       string
-	Message    string
-	NewKey     string
-	MCPURL     string
-	Providers  []providerView
-	Keys       []keyView
-	DefaultTTL int
-	MaxTTL     int
+	User        string
+	CSRF        string
+	Message     string
+	NewKey      string
+	MCPURL      string
+	KeysEnabled bool
+	Providers   []providerView
+	Keys        []keyView
+	DefaultTTL  int
+	MaxTTL      int
 }
 
 func (h *Handler) render(w http.ResponseWriter, r *http.Request, s session, msg, newKey string) {
@@ -414,6 +427,7 @@ func (h *Handler) render(w http.ResponseWriter, r *http.Request, s session, msg,
 	data := pageData{
 		User: s.User, CSRF: s.CSRF, Message: msg, NewKey: newKey, MCPURL: h.cfg.PublicURL + "/mcp",
 		DefaultTTL: int(h.cfg.APIKeyDefault.Hours() / 24), MaxTTL: int(h.cfg.APIKeyMax.Hours() / 24),
+		KeysEnabled: !h.cfg.DisableAPIKeys,
 	}
 	for _, p := range []store.Provider{store.Confluence, store.Jira} {
 		if _, ok := h.cfg.Connectors[p]; !ok {

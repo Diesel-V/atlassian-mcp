@@ -3,8 +3,20 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -121,4 +133,102 @@ func TestHTTPClientTimeout(t *testing.T) {
 	if _, err := httpClient(&config.Config{CAFile: "/nonexistent"}); err == nil {
 		t.Fatal("missing CA_FILE accepted")
 	}
+}
+
+type fakeSchema struct{ migrated, checked bool }
+
+func (f *fakeSchema) Migrate(context.Context) error     { f.migrated = true; return nil }
+func (f *fakeSchema) CheckSchema(context.Context) error { f.checked = true; return nil }
+
+func TestPrepareSchema(t *testing.T) {
+	f := &fakeSchema{}
+	if err := prepareSchema(context.Background(), f, true); err != nil || !f.migrated || f.checked {
+		t.Fatalf("migrate on start: %+v %v", f, err)
+	}
+	f = &fakeSchema{}
+	if err := prepareSchema(context.Background(), f, false); err != nil || f.migrated || !f.checked {
+		t.Fatalf("runtime role must only check: %+v %v", f, err)
+	}
+}
+
+// TestListenTLS serves over TLS with the configured certificate and refuses plain HTTP.
+func TestListenTLS(t *testing.T) {
+	dir := t.TempDir()
+	certFile, keyFile, pool := selfSigned(t, dir)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+
+	srv := &http.Server{
+		Addr:      addr,
+		Handler:   http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") }),
+		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	done := make(chan error, 1)
+	go func() { done <- listen(srv, certFile, keyFile) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		if err := <-done; err != nil {
+			t.Errorf("listen: %v", err)
+		}
+	})
+
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
+	var resp *http.Response
+	for i := 0; i < 50; i++ {
+		if resp, err = client.Get("https://" + addr); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("https: %v", err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(b) != "ok" || resp.TLS == nil {
+		t.Fatalf("https response %q tls=%v", b, resp.TLS != nil)
+	}
+
+	plain, err := (&http.Client{Timeout: 2 * time.Second}).Get("http://" + addr)
+	if err == nil {
+		defer plain.Body.Close()
+		if plain.StatusCode != http.StatusBadRequest {
+			t.Fatalf("plain HTTP accepted: %d", plain.StatusCode)
+		}
+	}
+
+	old := &tls.Config{RootCAs: pool, MaxVersion: tls.VersionTLS11}
+	if _, err := (&http.Client{Transport: &http.Transport{TLSClientConfig: old}}).Get("https://" + addr); err == nil {
+		t.Fatal("TLS 1.1 accepted")
+	}
+}
+
+func selfSigned(t *testing.T, dir string) (certFile, keyFile string, pool *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "127.0.0.1"},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kder, _ := x509.MarshalECPrivateKey(key)
+	certFile, keyFile = filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key")
+	_ = os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600)
+	_ = os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kder}), 0o600)
+	cert, _ := x509.ParseCertificate(der)
+	pool = x509.NewCertPool()
+	pool.AddCert(cert)
+	return certFile, keyFile, pool
 }

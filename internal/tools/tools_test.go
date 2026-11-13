@@ -15,6 +15,7 @@ import (
 	"atlassian-mcp/internal/atlassian/jira"
 	"atlassian-mcp/internal/identity"
 	"atlassian-mcp/internal/metrics"
+	"atlassian-mcp/internal/scope"
 	"atlassian-mcp/internal/store"
 )
 
@@ -35,29 +36,59 @@ func (f *fakeCreds) Invalidate(_ context.Context, _ identity.Subject, p store.Pr
 	return nil
 }
 
-type fakeConfluence struct{ err error }
+// fakeConfluence returns page 1 in TECHOPS and page 2 in HR, whatever was asked:
+// the scope filter must hold even if the product ignores the query restriction.
+type fakeConfluence struct {
+	err    error
+	params *confluence.SearchParams // last search
+	gets   *int
+}
 
-func (f fakeConfluence) Search(context.Context, atlassian.Auth, confluence.SearchParams) ([]confluence.SearchResult, error) {
+func (f fakeConfluence) Search(_ context.Context, _ atlassian.Auth, p confluence.SearchParams) ([]confluence.SearchResult, error) {
+	if f.params != nil {
+		*f.params = p
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
 	return []confluence.SearchResult{
-		{ID: "1", Title: "Секретный заголовок", Excerpt: "секретное содержимое"},
-		{ID: "2", Title: "Другой", Excerpt: "текст"},
+		{ID: "1", Space: "TECHOPS", Title: "Секретный заголовок", Excerpt: "секретное содержимое"},
+		{ID: "2", Space: "HR", Title: "Другой", Excerpt: "текст"},
 	}, nil
 }
 
-func (f fakeConfluence) GetPage(context.Context, atlassian.Auth, string) (*confluence.Page, error) {
-	return nil, f.err
+func (f fakeConfluence) GetPage(_ context.Context, _ atlassian.Auth, ref string) (*confluence.Page, error) {
+	if f.gets != nil {
+		*f.gets++
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	space := map[string]string{"1": "TECHOPS", "2": "HR"}[ref]
+	return &confluence.Page{ID: ref, Space: space, Body: "тело страницы " + ref}, nil
 }
 
-type fakeJira struct{}
-
-func (fakeJira) Search(context.Context, atlassian.Auth, jira.SearchParams) (*jira.SearchResult, error) {
-	return &jira.SearchResult{Issues: []jira.IssueSummary{}}, nil
+// fakeJira returns OD-1 and HR-2 from any search; OD-9 was moved to HR-9.
+type fakeJira struct {
+	params *jira.SearchParams
+	gets   *int
 }
-func (fakeJira) GetIssue(context.Context, atlassian.Auth, string) (*jira.Issue, error) {
-	return &jira.Issue{}, nil
+
+func (f fakeJira) Search(_ context.Context, _ atlassian.Auth, p jira.SearchParams) (*jira.SearchResult, error) {
+	if f.params != nil {
+		*f.params = p
+	}
+	return &jira.SearchResult{Total: 2, Issues: []jira.IssueSummary{{Key: "OD-1"}, {Key: "HR-2"}}}, nil
+}
+
+func (f fakeJira) GetIssue(_ context.Context, _ atlassian.Auth, key string) (*jira.Issue, error) {
+	if f.gets != nil {
+		*f.gets++
+	}
+	if key == "OD-9" {
+		key = "HR-9"
+	}
+	return &jira.Issue{IssueSummary: jira.IssueSummary{Key: key}, Description: "описание " + key}, nil
 }
 
 type recAudit struct {
@@ -83,6 +114,7 @@ func newService(creds *fakeCreds, conf ConfluenceAPI) (*Service, *recAudit) {
 	a := &recAudit{}
 	return &Service{
 		Confluence: conf, Jira: fakeJira{}, Creds: creds, Audit: a, Limiter: allowAll{},
+		Spaces: scope.All(), Projects: scope.All(),
 		Metrics: NewMetrics(metrics.NewRegistry()), PublicURL: "https://mcp.example",
 	}, a
 }
@@ -100,7 +132,8 @@ func TestRunSuccess(t *testing.T) {
 		t.Fatalf("out = %+v, err = %v", out, err)
 	}
 	e := a.entries[0]
-	if e.Status != statusOK || e.Results != 2 || e.Principal != "alice" || e.Tool != "confluence_search" {
+	if e.Status != statusOK || e.Results != 2 || e.Principal != "alice" || e.Tool != "confluence_search" ||
+		strings.Join(e.Objects, ",") != "1,2" {
 		t.Fatalf("audit = %+v", e)
 	}
 	// The query is recorded for investigations; document content never is.
@@ -191,4 +224,116 @@ func TestRegisterOnlyEnabledProducts(t *testing.T) {
 	svc.Register(srv) // must not panic and must skip Confluence
 	svc.Jira = nil
 	svc.Register(mcp.NewServer(&mcp.Implementation{Name: "t"}, nil))
+}
+
+// --- pilot scope ---
+
+func scoped(t *testing.T) (*Service, *recAudit, *confluence.SearchParams, *jira.SearchParams, *int) {
+	t.Helper()
+	cp, jp, gets := &confluence.SearchParams{}, &jira.SearchParams{}, new(int)
+	svc, a := newService(&fakeCreds{}, fakeConfluence{params: cp, gets: gets})
+	svc.Jira = fakeJira{params: jp, gets: gets}
+	svc.Spaces, svc.Projects = scope.Of("TECHOPS"), scope.Of("OD")
+	return svc, a, cp, jp, gets
+}
+
+func TestScopeConfluenceSearch(t *testing.T) {
+	svc, a, params, _, _ := scoped(t)
+	ctx := context.Background()
+
+	_, out, err := svc.confluenceSearch(ctx, reqFor(alice), ConfluenceSearchInput{Query: "x"})
+	if err != nil || strings.Join(params.Spaces, ",") != "TECHOPS" {
+		t.Fatalf("default spaces = %v, err %v", params.Spaces, err)
+	}
+	if len(out.Results) != 1 || out.Results[0].ID != "1" || strings.Join(a.entries[0].Objects, ",") != "1" {
+		t.Fatalf("result outside the scope passed on: %+v, audit %v", out.Results, a.entries[0].Objects)
+	}
+
+	*params = confluence.SearchParams{}
+	_, _, err = svc.confluenceSearch(ctx, reqFor(alice), ConfluenceSearchInput{Query: "x", Spaces: []string{"HR"}})
+	if err == nil || !strings.Contains(err.Error(), "TECHOPS") || params.Query != "" {
+		t.Fatalf("space outside the scope: err=%v, searched=%+v", err, params)
+	}
+	if a.entries[1].Status != statusInvalid {
+		t.Fatalf("status = %s", a.entries[1].Status)
+	}
+}
+
+func TestScopeConfluenceGetPage(t *testing.T) {
+	svc, a, _, _, _ := scoped(t)
+	ctx := context.Background()
+	if _, p, err := svc.confluenceGetPage(ctx, reqFor(alice), ConfluenceGetPageInput{Page: "1"}); err != nil || p == nil {
+		t.Fatalf("page in scope: %v", err)
+	}
+	_, p, err := svc.confluenceGetPage(ctx, reqFor(alice), ConfluenceGetPageInput{Page: "2"})
+	if p != nil || err == nil || !strings.Contains(err.Error(), "нет прав доступа") || strings.Contains(err.Error(), "HR") {
+		t.Fatalf("page outside the scope: page=%+v err=%v", p, err)
+	}
+	e := a.entries[1]
+	if e.Status != statusOutOfScope || e.Results != 0 || strings.Join(e.Objects, ",") != "2" {
+		t.Fatalf("audit = %+v", e)
+	}
+}
+
+func TestScopeJira(t *testing.T) {
+	svc, a, _, params, gets := scoped(t)
+	ctx := context.Background()
+
+	_, out, err := svc.jiraSearch(ctx, reqFor(alice), JiraSearchInput{Text: "x"})
+	if err != nil || strings.Join(params.Projects, ",") != "OD" || len(out.Issues) != 1 || out.Issues[0].Key != "OD-1" {
+		t.Fatalf("search: projects=%v out=%+v err=%v", params.Projects, out, err)
+	}
+	if _, _, err := svc.jiraSearch(ctx, reqFor(alice), JiraSearchInput{JQL: "project = HR"}); err == nil || !strings.Contains(err.Error(), "raw jql") {
+		t.Fatalf("raw jql with a project allowlist: %v", err)
+	}
+	if _, _, err := svc.jiraSearch(ctx, reqFor(alice), JiraSearchInput{Text: "x", Projects: []string{"HR"}}); err == nil {
+		t.Fatal("project outside the scope accepted")
+	}
+
+	*gets = 0
+	if _, is, err := svc.jiraGetIssue(ctx, reqFor(alice), JiraGetIssueInput{Key: "HR-5"}); is != nil || err == nil || *gets != 0 {
+		t.Fatalf("issue outside the scope: issue=%v err=%v requests=%d", is, err, *gets)
+	}
+	if _, is, err := svc.jiraGetIssue(ctx, reqFor(alice), JiraGetIssueInput{Key: "OD-9"}); is != nil || err == nil {
+		t.Fatalf("issue moved out of the scope returned: %+v %v", is, err)
+	}
+	last := a.entries[len(a.entries)-1]
+	if last.Status != statusOutOfScope || strings.Join(last.Objects, ",") != "OD-9,HR-9" {
+		t.Fatalf("audit for moved issue = %+v", last)
+	}
+	if _, is, err := svc.jiraGetIssue(ctx, reqFor(alice), JiraGetIssueInput{Key: " od-1 "}); err != nil || is.Key != "OD-1" {
+		t.Fatalf("issue in scope: %+v %v", is, err)
+	}
+
+	// Unrestricted projects keep raw JQL available.
+	svc.Projects = scope.All()
+	if _, _, err := svc.jiraSearch(ctx, reqFor(alice), JiraSearchInput{JQL: "project = HR"}); err != nil {
+		t.Fatalf("raw jql without allowlist: %v", err)
+	}
+}
+
+func TestScopeZeroValueDeniesEverything(t *testing.T) {
+	svc, _ := newService(&fakeCreds{}, fakeConfluence{})
+	svc.Spaces, svc.Projects = scope.Set{}, scope.Set{}
+	ctx := context.Background()
+	if _, out, _ := svc.confluenceSearch(ctx, reqFor(alice), ConfluenceSearchInput{Query: "x"}); len(out.Results) != 0 {
+		t.Fatalf("unconfigured scope returned %d results", len(out.Results))
+	}
+	if _, p, _ := svc.confluenceGetPage(ctx, reqFor(alice), ConfluenceGetPageInput{Page: "1"}); p != nil {
+		t.Fatal("unconfigured scope returned a page")
+	}
+	if _, is, _ := svc.jiraGetIssue(ctx, reqFor(alice), JiraGetIssueInput{Key: "OD-1"}); is != nil {
+		t.Fatal("unconfigured scope returned an issue")
+	}
+}
+
+func TestToolDescriptionsListScope(t *testing.T) {
+	svc, _, _, _, _ := scoped(t)
+	if d := svc.jiraSearchDescription(); !strings.Contains(d, "Raw JQL is not available") || !strings.Contains(d, "OD") {
+		t.Fatalf("restricted description = %q", d)
+	}
+	svc.Projects = scope.All()
+	if d := svc.jiraSearchDescription(); !strings.Contains(d, "raw JQL query") {
+		t.Fatalf("unrestricted description = %q", d)
+	}
 }

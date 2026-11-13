@@ -1,38 +1,47 @@
-# Single-host deployment: the service and its PostgreSQL, next to Open WebUI on the shared "llm" network.
-# TLS termination and the public name (PUBLIC_URL) are provided by the reverse proxy.
+# Deployment on the dedicated MCP VM (own VLAN). The image comes from the internal
+# registry (built and scanned in CI); nothing is built or downloaded on the VM.
+#
+#   /etc/atlassian-mcp/.env             non-secret settings (see .env.example), 0640
+#   /run/atlassian-mcp/secrets/         secrets rendered by Vault Agent, files 0400 owned by 65532
+#   /run/atlassian-mcp/migrator/        schema owner DSN, only for "migrate" (optional, see README)
+#   /etc/atlassian-mcp/tls/             tls.crt / tls.key for the link reverse proxy -> VM
+#
+# PostgreSQL is the managed cluster with its regular backups, not a container here.
+
+x-hardening: &hardening
+  user: "65532:65532"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 256
+
 services:
   atlassian-mcp:
-    image: atlassian-mcp:${VERSION:-dev}
-    build:
-      context: ..
-      args:
-        VERSION: ${VERSION:-dev}
+    <<: *hardening
+    image: ${REGISTRY_IMAGE:?set REGISTRY_IMAGE}:${VERSION:?set VERSION}
     restart: unless-stopped
-    env_file: .env
+    env_file: /etc/atlassian-mcp/.env
     ports:
-      - "8082:8080"   # behind the reverse proxy
-    # - "9090:9090" # metrics; expose only to Prometheus
+      - "8082:8080"   # TLS; firewall: reverse proxy only
+      - "9090:9090"   # metrics, plain HTTP; firewall: monitoring only
     volumes:
-      - /etc/ssl/certs:/etc/ssl/certs:ro
-    networks: [llm, default]
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  postgres:
-    image: postgres:17
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: amcp
-      POSTGRES_USER: amcp
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
-    volumes:
-      - /data/atlassian-mcp/postgres:/var/lib/postgresql/data
+      - /run/atlassian-mcp/secrets:/run/secrets:ro
+      - /etc/atlassian-mcp/tls:/tls:ro
+    mem_limit: 512m
+    cpus: 1.0
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U amcp -d amcp"]
-      interval: 5s
-      retries: 10
+      disable: true # scratch image has no shell; health is checked from outside (/healthz, /readyz)
 
-networks:
-  llm:
-    external: true
+  # One-off schema migration as the schema owner:
+  #   docker compose --profile migrate run --rm migrate
+  migrate:
+    <<: *hardening
+    profiles: [migrate]
+    image: ${REGISTRY_IMAGE:?set REGISTRY_IMAGE}:${VERSION:?set VERSION}
+    command: ["migrate"]
+    env_file: /etc/atlassian-mcp/.env
+    environment:
+      MIGRATE_DATABASE_URL_FILE: /run/migrator/database_url
+    volumes:
+      - /run/atlassian-mcp/secrets:/run/secrets:ro
+      - /run/atlassian-mcp/migrator:/run/migrator:ro

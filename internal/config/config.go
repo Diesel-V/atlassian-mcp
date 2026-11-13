@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,8 @@ type Provider struct {
 	ClientID     string
 	ClientSecret string
 	Scopes       []string
+	// Allowed lists the approved space (Confluence) or project (Jira) keys; ["*"] allows all.
+	Allowed []string
 }
 
 // Enabled reports whether the provider is configured.
@@ -31,6 +34,12 @@ type Config struct {
 	DatabaseURL string
 	CAFile      string
 
+	TLSCertFile string // with TLSKeyFile: serve HTTPS on ListenAddr
+	TLSKeyFile  string
+
+	MigrateOnStart     bool   // false when the runtime role may not change the schema
+	MigrateDatabaseURL string // schema owner for "atlassian-mcp migrate"; defaults to DatabaseURL
+
 	EncryptionKey []byte // 32 bytes, encrypts stored Atlassian credentials
 	SessionKey    []byte // 32 bytes, protects browser cookies
 
@@ -40,6 +49,11 @@ type Config struct {
 	KeycloakWebClientSecret string
 	UsernameClaim           string
 	UsernameStripDomain     string
+	RequiredGroup           string // if set, users must be in this Keycloak group
+	GroupsClaim             string
+
+	EnableAPIKeys bool // personal agent keys
+	EnableAgents  bool // autonomous agents (client credentials)
 
 	Confluence Provider
 	Jira       Provider
@@ -58,14 +72,23 @@ type Config struct {
 func Load() (*Config, error) { return LoadFrom(os.Getenv) }
 
 // LoadFrom reads configuration using getenv; it is separated for tests.
+// Any variable may instead be read from a file named by <NAME>_FILE (for
+// secrets rendered by Vault Agent); setting both is an error.
 func LoadFrom(getenv func(string) string) (*Config, error) {
-	l := loader{getenv: getenv}
+	l := loader{}
+	l.getenv = l.withFiles(getenv)
 	c := &Config{
 		ListenAddr:  l.str("LISTEN_ADDR", ":8080"),
 		MetricsAddr: l.str("METRICS_ADDR", ":9090"),
 		PublicURL:   strings.TrimRight(l.required("PUBLIC_URL"), "/"),
 		DatabaseURL: l.required("DATABASE_URL"),
 		CAFile:      l.str("CA_FILE", ""),
+
+		TLSCertFile: l.str("TLS_CERT_FILE", ""),
+		TLSKeyFile:  l.str("TLS_KEY_FILE", ""),
+
+		MigrateOnStart:     l.bool("MIGRATE_ON_START", true),
+		MigrateDatabaseURL: l.str("MIGRATE_DATABASE_URL", ""),
 
 		EncryptionKey: l.key("ENCRYPTION_KEY"),
 		SessionKey:    l.key("SESSION_KEY"),
@@ -76,9 +99,14 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		KeycloakWebClientSecret: l.required("KEYCLOAK_WEB_CLIENT_SECRET"),
 		UsernameClaim:           l.str("USERNAME_CLAIM", "preferred_username"),
 		UsernameStripDomain:     strings.TrimPrefix(l.str("USERNAME_STRIP_DOMAIN", ""), "@"),
+		RequiredGroup:           l.str("KEYCLOAK_REQUIRED_GROUP", ""),
+		GroupsClaim:             l.str("KEYCLOAK_GROUPS_CLAIM", "groups"),
 
-		Confluence: l.provider("CONFLUENCE"),
-		Jira:       l.provider("JIRA"),
+		EnableAPIKeys: l.bool("ENABLE_API_KEYS", false),
+		EnableAgents:  l.bool("ENABLE_AGENTS", false),
+
+		Confluence: l.provider("CONFLUENCE", "SPACES"),
+		Jira:       l.provider("JIRA", "PROJECTS"),
 
 		APIKeyDefaultTTL: l.duration("API_KEY_DEFAULT_TTL", 90*24*time.Hour),
 		APIKeyMaxTTL:     l.duration("API_KEY_MAX_TTL", 180*24*time.Hour),
@@ -88,6 +116,9 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		MaxContentChars:  l.int("MAX_CONTENT_CHARS", 20000),
 		SessionTTL:       l.duration("SESSION_TTL", 8*time.Hour),
 		AuditRetention:   l.duration("AUDIT_RETENTION", 365*24*time.Hour),
+	}
+	if c.MigrateDatabaseURL == "" {
+		c.MigrateDatabaseURL = c.DatabaseURL
 	}
 	if len(l.errs) > 0 {
 		return nil, errors.Join(l.errs...)
@@ -120,12 +151,76 @@ func (c *Config) validate() error {
 	if len(c.KeycloakUserClients) == 0 {
 		errs = append(errs, errors.New("KEYCLOAK_USER_CLIENTS must not be empty"))
 	}
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		errs = append(errs, errors.New("TLS_CERT_FILE and TLS_KEY_FILE must be set together"))
+	}
+	errs = append(errs, validateAllowed("CONFLUENCE_ALLOWED_SPACES", c.Confluence, spaceKeyRe)...)
+	errs = append(errs, validateAllowed("JIRA_ALLOWED_PROJECTS", c.Jira, projectKeyRe)...)
 	return errors.Join(errs...)
+}
+
+var (
+	spaceKeyRe   = regexp.MustCompile(`^~?[A-Za-z0-9][A-Za-z0-9._@-]{0,254}$`) // ~login for personal spaces
+	projectKeyRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,254}$`)
+)
+
+// validateAllowed requires an explicit allowlist for an enabled product: the
+// pilot is approved for specific spaces and projects only, so a missing list
+// must not silently mean "everything".
+func validateAllowed(name string, p Provider, keyRe *regexp.Regexp) []error {
+	if !p.Enabled() {
+		return nil
+	}
+	if len(p.Allowed) == 0 {
+		return []error{fmt.Errorf("%s is required (comma-separated keys, or * to allow all)", name)}
+	}
+	if len(p.Allowed) == 1 && p.Allowed[0] == "*" {
+		return nil
+	}
+	var errs []error
+	for _, k := range p.Allowed {
+		if !keyRe.MatchString(k) {
+			errs = append(errs, fmt.Errorf("%s: invalid key %q", name, k))
+		}
+	}
+	return errs
 }
 
 type loader struct {
 	getenv func(string) string
 	errs   []error
+}
+
+// withFiles wraps getenv so that NAME_FILE=/path supplies the value of NAME.
+func (l *loader) withFiles(getenv func(string) string) func(string) string {
+	return func(name string) string {
+		path := strings.TrimSpace(getenv(name + "_FILE"))
+		if path == "" {
+			return getenv(name)
+		}
+		if strings.TrimSpace(getenv(name)) != "" {
+			l.errs = append(l.errs, fmt.Errorf("set either %s or %s_FILE, not both", name, name))
+			return ""
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			l.errs = append(l.errs, fmt.Errorf("%s_FILE: %w", name, err))
+			return ""
+		}
+		return strings.TrimSpace(string(b))
+	}
+}
+
+func (l *loader) bool(name string, def bool) bool {
+	raw := l.str(name, "")
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s: %w", name, err))
+	}
+	return v
 }
 
 func (l *loader) str(name, def string) string {
@@ -190,7 +285,7 @@ func (l *loader) duration(name string, def time.Duration) time.Duration {
 	return v
 }
 
-func (l *loader) provider(prefix string) Provider {
+func (l *loader) provider(prefix, allowed string) Provider {
 	base := strings.TrimRight(l.str(prefix+"_URL", ""), "/")
 	if base == "" {
 		return Provider{}
@@ -200,5 +295,6 @@ func (l *loader) provider(prefix string) Provider {
 		ClientID:     l.required(prefix + "_CLIENT_ID"),
 		ClientSecret: l.required(prefix + "_CLIENT_SECRET"),
 		Scopes:       l.list(prefix+"_SCOPES", "READ"),
+		Allowed:      l.list(prefix+"_ALLOWED_"+allowed, ""),
 	}
 }

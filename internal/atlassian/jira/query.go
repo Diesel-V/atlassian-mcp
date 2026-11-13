@@ -30,6 +30,14 @@ var (
 	usernameRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@-]{0,254}$`)
 )
 
+// ProjectOf returns the project key of an issue key (OD-123 -> OD), or "" if key is malformed.
+func ProjectOf(key string) string {
+	if !issueKeyRe.MatchString(key) {
+		return ""
+	}
+	return key[:strings.LastIndexByte(key, '-')]
+}
+
 // ValidIssueKey reports whether key looks like PROJ-123.
 func ValidIssueKey(key string) bool { return issueKeyRe.MatchString(key) }
 

@@ -84,6 +84,7 @@ type AuditEntry struct {
 	KeyID       string
 	Tool        string
 	Params      json.RawMessage
+	Objects     []string // IDs of pages/issues found or opened; never their content
 	Results     int
 	Status      string
 	DurationMS  int64

@@ -67,7 +67,7 @@ func (r *fakeRealm) sign(t *testing.T, signer jose.Signer, claims map[string]any
 func TestKeycloakVerifier(t *testing.T) {
 	realm := newFakeRealm(t)
 	ctx := context.Background()
-	v, err := NewKeycloakVerifier(ctx, realm.issuer(), "preferred_username", realm.srv.Client())
+	v, err := NewKeycloakVerifier(ctx, realm.issuer(), "preferred_username", "groups", realm.srv.Client())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +76,7 @@ func TestKeycloakVerifier(t *testing.T) {
 		return map[string]any{
 			"iss": realm.issuer(), "aud": "account", "azp": "open-webui",
 			"preferred_username": "i.ivanov@example.com",
+			"groups":             []string{"/ai-pilot", "/staff"},
 			"exp":                now.Add(time.Hour).Unix(), "iat": now.Unix(),
 		}
 	}
@@ -84,7 +85,8 @@ func TestKeycloakVerifier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.AuthorizedParty != "open-webui" || c.Username != "i.ivanov@example.com" || c.Expiry.Unix() != now.Add(time.Hour).Unix() {
+	if c.AuthorizedParty != "open-webui" || c.Username != "i.ivanov@example.com" || c.Expiry.Unix() != now.Add(time.Hour).Unix() ||
+		!InGroup(c.Groups, "ai-pilot") {
 		t.Fatalf("claims = %+v", c)
 	}
 
@@ -104,5 +106,29 @@ func TestKeycloakVerifier(t *testing.T) {
 		if _, err := v.Verify(ctx, tok); err == nil {
 			t.Errorf("%s token accepted", name)
 		}
+	}
+}
+
+func TestStringListAndInGroup(t *testing.T) {
+	if got := StringList([]any{"/a", 1, "b"}); len(got) != 2 || got[0] != "/a" || got[1] != "b" {
+		t.Fatalf("list = %v", got)
+	}
+	if got := StringList("solo"); len(got) != 1 || got[0] != "solo" {
+		t.Fatalf("single = %v", got)
+	}
+	if StringList(nil) != nil || StringList(42) != nil {
+		t.Fatal("non-list claims must give nil")
+	}
+	groups := []string{"/ai/pilot", "staff"}
+	for req, want := range map[string]bool{
+		"": true, "/ai/pilot": true, "ai/pilot": true, "staff": true, "/staff": true,
+		"pilot": false, "/ai": false, "admins": false,
+	} {
+		if InGroup(groups, req) != want {
+			t.Errorf("InGroup(%q) = %v, want %v", req, !want, want)
+		}
+	}
+	if InGroup(nil, "pilot") {
+		t.Fatal("no groups must not match a required group")
 	}
 }

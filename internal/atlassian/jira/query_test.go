@@ -67,3 +67,11 @@ func TestValidIssueKey(t *testing.T) {
 		}
 	}
 }
+
+func TestProjectOf(t *testing.T) {
+	for in, want := range map[string]string{"OD-123": "OD", "MY_PROJ2-1": "MY_PROJ2", "od-1": "", "OD": "", "OD-0": "", "": "", "A-B-1": ""} {
+		if got := ProjectOf(in); got != want {
+			t.Errorf("ProjectOf(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

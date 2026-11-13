@@ -24,6 +24,7 @@ import (
 	"atlassian-mcp/internal/metrics"
 	"atlassian-mcp/internal/offboard"
 	"atlassian-mcp/internal/ratelimit"
+	"atlassian-mcp/internal/scope"
 	"atlassian-mcp/internal/store"
 	"atlassian-mcp/internal/store/memory"
 	"atlassian-mcp/internal/tools"
@@ -79,8 +80,14 @@ func (f *fakeAtlassian) handler() http.Handler {
 				return
 			}
 			_, _ = io.WriteString(w, `{"results":[{"content":{"id":"1","type":"page","title":"Регламент","space":{"key":"TECHOPS"},"_links":{"webui":"/x/1"}},"excerpt":"выкатки"}]}`)
+		case "/rest/api/content/1":
+			_, _ = io.WriteString(w, `{"id":"1","type":"page","title":"Регламент","space":{"key":"TECHOPS"},"body":{"view":{"value":"<p>выкатки по вторникам</p>"}},"_links":{"webui":"/x/1"}}`)
+		case "/rest/api/content/7":
+			_, _ = io.WriteString(w, `{"id":"7","type":"page","title":"Зарплаты","space":{"key":"LLM"},"body":{"view":{"value":"<p>секретные данные</p>"}},"_links":{"webui":"/x/7"}}`)
 		case "/rest/api/2/search":
 			_, _ = io.WriteString(w, `{"total":1,"issues":[{"key":"OD-1","fields":{"summary":"Тест"}}]}`)
+		case "/rest/api/2/issue/HR-1":
+			_, _ = io.WriteString(w, `{"key":"HR-1","fields":{"summary":"Увольнение","description":"секретные данные"}}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -111,6 +118,12 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	return newTestEnvWith(t, func(*tools.Service, *identity.Resolver) {})
+}
+
+// newTestEnvWith lets a test restrict the pilot scope and access paths.
+func newTestEnvWith(t *testing.T, configure func(*tools.Service, *identity.Resolver)) *testEnv {
+	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	st := memory.New()
 	atl := &fakeAtlassian{reject: map[string]bool{}, hold: make(chan struct{})}
@@ -126,6 +139,7 @@ func newTestEnv(t *testing.T) *testEnv {
 			"kc-slow":   {AuthorizedParty: "open-webui", Username: "slow", Expiry: exp},
 			"kc-bot":    {AuthorizedParty: "ticket-bot", Expiry: exp},
 			"kc-rogue":  {AuthorizedParty: "rogue-client", Expiry: exp},
+			"kc-pilot":  {AuthorizedParty: "open-webui", Username: "alice@example.com", Groups: []string{"/ai-pilot"}, Expiry: exp},
 		},
 		Keys: st, Agents: st, UserClients: []string{"open-webui"}, StripDomain: "example.com", Log: log,
 	}
@@ -153,7 +167,10 @@ func newTestEnv(t *testing.T) *testEnv {
 		Limiter:    ratelimit.New(1000),
 		Metrics:    tm,
 		PublicURL:  "https://mcp.example",
+		Spaces:     scope.All(),
+		Projects:   scope.All(),
 	}
+	configure(svc, resolver)
 	router := Router(MCPHandler(svc, resolver, "test", log), http.NotFoundHandler(), st, log)
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
@@ -452,5 +469,98 @@ func TestHealth(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("%s: %d", p, resp.StatusCode)
 		}
+	}
+}
+
+// TestPilotScope checks the security requirements of the pilot end to end:
+// only the pilot group, only through Open WebUI, only approved spaces and projects.
+func TestPilotScope(t *testing.T) {
+	e := newTestEnvWith(t, func(svc *tools.Service, r *identity.Resolver) {
+		svc.Spaces, svc.Projects = scope.Of("TECHOPS"), scope.Of("OD")
+		r.RequiredGroup, r.DisableAPIKeys, r.DisableAgents = "ai-pilot", true, true
+	})
+	ctx := context.Background()
+	full, id, secret, _ := identity.NewAPIKey()
+	_ = e.st.CreateAPIKey(ctx, &store.APIKey{ID: id, Username: "alice", Name: "oc",
+		SecretHash: identity.HashSecret(secret), CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour)})
+
+	// Access paths: user outside the group 403, agent 403, personal key 401.
+	for tok, want := range map[string]int{"kc-alice": http.StatusForbidden, "kc-bot": http.StatusForbidden, full: http.StatusUnauthorized} {
+		req, _ := http.NewRequest(http.MethodPost, e.url+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("token %.12s…: status %d, want %d", tok, resp.StatusCode, want)
+		}
+	}
+
+	cs := e.session(t, "kc-pilot")
+
+	// Search is limited to approved spaces in the query itself.
+	if res, text := call(t, cs, "confluence_search", map[string]any{"query": "регламент"}); res.IsError || !strings.Contains(text, "TECHOPS") {
+		t.Fatalf("search in scope: %s", text)
+	}
+	e.atl.mu.Lock()
+	cql := e.atl.cqlSeen[len(e.atl.cqlSeen)-1]
+	e.atl.mu.Unlock()
+	if !strings.Contains(cql, `space in ("TECHOPS")`) {
+		t.Fatalf("cql not restricted: %s", cql)
+	}
+
+	// A space outside the scope is refused before any request.
+	reqs := e.atl.requests()
+	if res, text := call(t, cs, "confluence_search", map[string]any{"query": "x", "spaces": []string{"LLM"}}); !res.IsError || e.atl.requests() != reqs {
+		t.Fatalf("space outside scope: %s", text)
+	}
+
+	// By ID: page 7 lives in LLM, issue HR-1 in HR — content must not reach the model.
+	if res, text := call(t, cs, "confluence_get_page", map[string]any{"page": "7"}); !res.IsError || strings.Contains(text, "секретные") {
+		t.Fatalf("page outside scope: %s", text)
+	}
+	if res, text := call(t, cs, "jira_get_issue", map[string]any{"key": "HR-1"}); !res.IsError || strings.Contains(text, "секретные") {
+		t.Fatalf("issue outside scope: %s", text)
+	}
+	if res, text := call(t, cs, "jira_search", map[string]any{"jql": "project = HR"}); !res.IsError {
+		t.Fatalf("raw jql: %s", text)
+	}
+	if res, text := call(t, cs, "confluence_get_page", map[string]any{"page": "1"}); res.IsError || !strings.Contains(text, "вторникам") {
+		t.Fatalf("page in scope: %s", text)
+	}
+
+	// Tool list tells the model what is available and offers no write tools.
+	tl, err := cs.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tl.Tools {
+		if strings.Contains(tool.Name, "create") || strings.Contains(tool.Name, "update") || !tool.Annotations.ReadOnlyHint {
+			t.Errorf("write-capable tool exposed: %s", tool.Name)
+		}
+		if tool.Name == "jira_search" && !strings.Contains(tool.Description, "Raw JQL is not available") {
+			t.Errorf("jira_search description: %s", tool.Description)
+		}
+	}
+
+	// Audit names the objects, including the refused ones; never their content.
+	var outOfScope int
+	for _, a := range e.st.AuditEntries() {
+		if a.Status == "out_of_scope" {
+			outOfScope++
+			if j := strings.Join(a.Objects, ","); j != "7" && j != "HR-1" {
+				t.Errorf("out-of-scope audit objects = %q", j)
+			}
+		}
+		if strings.Contains(string(a.Params), "секретные") || strings.Contains(a.Error, "секретные") {
+			t.Errorf("document content in audit: %+v", a)
+		}
+	}
+	if outOfScope != 2 {
+		t.Errorf("out-of-scope audit entries = %d, want 2", outOfScope)
 	}
 }

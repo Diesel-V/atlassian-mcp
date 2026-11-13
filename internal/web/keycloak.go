@@ -25,12 +25,15 @@ type KeycloakLogin struct {
 	verifier      *oidc.IDTokenVerifier
 	usernameClaim string
 	stripDomain   string
+	requiredGroup string
+	groupsClaim   string
 	http          *http.Client
 }
 
 // NewKeycloakLogin discovers the realm and configures the web client.
-func NewKeycloakLogin(ctx context.Context, issuer, clientID, clientSecret, redirectURL, usernameClaim, stripDomain string,
-	httpClient *http.Client) (*KeycloakLogin, error) {
+// requiredGroup, if set, admits only members of that Keycloak group (read from groupsClaim of the ID token).
+func NewKeycloakLogin(ctx context.Context, issuer, clientID, clientSecret, redirectURL, usernameClaim, stripDomain,
+	requiredGroup, groupsClaim string, httpClient *http.Client) (*KeycloakLogin, error) {
 	if httpClient != nil {
 		ctx = oidc.ClientContext(ctx, httpClient)
 	}
@@ -46,6 +49,8 @@ func NewKeycloakLogin(ctx context.Context, issuer, clientID, clientSecret, redir
 		verifier:      p.Verifier(&oidc.Config{ClientID: clientID}),
 		usernameClaim: usernameClaim,
 		stripDomain:   stripDomain,
+		requiredGroup: requiredGroup,
+		groupsClaim:   groupsClaim,
 		http:          httpClient,
 	}, nil
 }
@@ -81,6 +86,9 @@ func (k *KeycloakLogin) Exchange(ctx context.Context, code, verifier, nonce stri
 	user := identity.NormalizeUsername(name, k.stripDomain)
 	if user == "" {
 		return "", fmt.Errorf("web: claim %q is empty", k.usernameClaim)
+	}
+	if !identity.InGroup(identity.StringList(claims[k.groupsClaim]), k.requiredGroup) {
+		return "", identity.ErrForbidden
 	}
 	return user, nil
 }

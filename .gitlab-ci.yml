@@ -1,0 +1,80 @@
+# Pipeline: lint -> test (with PostgreSQL) -> vulnerability checks -> image to the internal registry.
+# Required CI/CD variables (project or group level):
+#   GOPROXY          internal Go module proxy (public repositories are closed)
+#   REGISTRY_IMAGE   image name in the internal registry, defaults to $CI_REGISTRY_IMAGE
+#   IMAGE_MIRROR     prefix of the internal mirror for base images, e.g. registry-proxy.example.com/
+# Deployment is a separate decision (see docs: open question "who deploys after sudo is revoked").
+
+stages: [lint, test, scan, build, image-scan]
+
+variables:
+  GO_IMAGE: ${IMAGE_MIRROR}golang:1.25
+  REGISTRY_IMAGE: ${CI_REGISTRY_IMAGE}
+  IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
+  GOFLAGS: -mod=mod
+  GOCACHE: ${CI_PROJECT_DIR}/.cache/go-build
+  GOMODCACHE: ${CI_PROJECT_DIR}/.cache/go-mod
+
+default:
+  image: ${GO_IMAGE}
+  cache:
+    key: go-${CI_COMMIT_REF_SLUG}
+    paths: [.cache/]
+
+lint:
+  stage: lint
+  script:
+    - test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+    - go vet ./...
+
+test:
+  stage: test
+  services:
+    - name: ${IMAGE_MIRROR}postgres:17
+      alias: postgres
+  variables:
+    POSTGRES_PASSWORD: p
+    TEST_DATABASE_URL: postgres://postgres:p@postgres:5432/postgres?sslmode=disable
+  script:
+    - go test -race -count=1 -coverprofile=coverage.out ./...
+    - go tool cover -func=coverage.out | tail -1
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  artifacts:
+    paths: [coverage.out]
+    expire_in: 30 days
+
+govulncheck:
+  stage: scan
+  script:
+    - go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+build-image:
+  stage: build
+  image:
+    name: ${IMAGE_MIRROR}gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  cache: {}
+  script:
+    - |
+      DEST="--destination ${REGISTRY_IMAGE}:${IMAGE_TAG}"
+      if [ -n "$CI_COMMIT_TAG" ]; then DEST="$DEST --destination ${REGISTRY_IMAGE}:${CI_COMMIT_TAG}"; fi
+    - /kaniko/executor --context "$CI_PROJECT_DIR" --dockerfile Dockerfile
+        --build-arg VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+        --build-arg GOPROXY="$GOPROXY"
+        --build-arg GO_IMAGE="${IMAGE_MIRROR}golang:1.25-alpine"
+        $DEST
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+trivy:
+  stage: image-scan
+  image:
+    name: ${IMAGE_MIRROR}aquasec/trivy:0.58.1
+    entrypoint: [""]
+  cache: {}
+  script:
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "${REGISTRY_IMAGE}:${IMAGE_TAG}"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG

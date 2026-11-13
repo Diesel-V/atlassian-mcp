@@ -38,6 +38,7 @@ func newResolver(t *testing.T) (*Resolver, *memory.Store) {
 			"agent":       {AuthorizedParty: "ticket-bot", Username: "service-account-ticket-bot", Expiry: exp},
 			"disabled":    {AuthorizedParty: "old-bot", Expiry: exp},
 			"unknown":     {AuthorizedParty: "random-client", Expiry: exp},
+			"pilot":       {AuthorizedParty: "open-webui", Username: "p.petrov", Groups: []string{"/ai-pilot"}, Expiry: exp},
 		},
 		Keys:        st,
 		Agents:      st,
@@ -210,4 +211,36 @@ func flip(c byte) string {
 		return "B"
 	}
 	return "A"
+}
+
+func TestPilotRestrictions(t *testing.T) {
+	r, st := newResolver(t)
+	ctx := context.Background()
+	full, id, secret, _ := NewAPIKey()
+	_ = st.CreateAPIKey(ctx, &store.APIKey{ID: id, Username: "alice", Name: "k", SecretHash: HashSecret(secret), CreatedAt: now, ExpiresAt: now.Add(time.Hour)})
+	if _, _, err := r.Resolve(ctx, full); err != nil {
+		t.Fatalf("key before restrictions: %v", err)
+	}
+
+	r.RequiredGroup = "ai-pilot"
+	r.DisableAPIKeys = true
+	r.DisableAgents = true
+
+	if s, _, err := r.Resolve(ctx, "pilot"); err != nil || s.Username != "p.petrov" {
+		t.Fatalf("pilot member: %+v %v", s, err)
+	}
+	if _, exp, err := r.Resolve(ctx, "user"); !errors.Is(err, ErrForbidden) || exp.IsZero() {
+		t.Fatalf("user outside the pilot group: exp=%v err=%v", exp, err)
+	}
+	if _, _, err := r.Resolve(ctx, "agent"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("registered agent with agents disabled: %v", err)
+	}
+	if _, _, err := r.Resolve(ctx, full); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatalf("api key with keys disabled: %v", err)
+	}
+	// The verifier adapter turns the forbidden user into a 403 (no access scope).
+	ti, err := r.TokenVerifier()(ctx, "user", nil)
+	if err != nil || slices.Contains(ti.Scopes, ScopeAccess) {
+		t.Fatalf("forbidden user token info: %+v %v", ti, err)
+	}
 }

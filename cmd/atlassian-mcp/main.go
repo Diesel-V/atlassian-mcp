@@ -34,6 +34,7 @@ import (
 	"atlassian-mcp/internal/metrics"
 	"atlassian-mcp/internal/offboard"
 	"atlassian-mcp/internal/ratelimit"
+	"atlassian-mcp/internal/scope"
 	"atlassian-mcp/internal/server"
 	"atlassian-mcp/internal/store"
 	"atlassian-mcp/internal/store/postgres"
@@ -84,19 +85,39 @@ func logLevel() slog.Level {
 }
 
 func openStore(ctx context.Context, cfg *config.Config) (*postgres.Store, error) {
+	return openStoreAt(ctx, cfg, cfg.DatabaseURL)
+}
+
+func openStoreAt(ctx context.Context, cfg *config.Config, dsn string) (*postgres.Store, error) {
 	sealer, err := crypto.NewSealer(cfg.EncryptionKey)
 	if err != nil {
 		return nil, err
 	}
-	return postgres.Open(ctx, cfg.DatabaseURL, sealer)
+	return postgres.Open(ctx, dsn, sealer)
 }
 
+// schemaChecker is the part of the store that prepareSchema needs.
+type schemaChecker interface {
+	Migrate(ctx context.Context) error
+	CheckSchema(ctx context.Context) error
+}
+
+// prepareSchema migrates when the runtime role may change the schema; otherwise
+// it only verifies that the schema owner has applied every migration.
+func prepareSchema(ctx context.Context, st schemaChecker, migrateOnStart bool) error {
+	if migrateOnStart {
+		return st.Migrate(ctx)
+	}
+	return st.CheckSchema(ctx)
+}
+
+// migrate applies migrations as the schema owner (MIGRATE_DATABASE_URL).
 func migrate(ctx context.Context) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	st, err := openStore(ctx, cfg)
+	st, err := openStoreAt(ctx, cfg, cfg.MigrateDatabaseURL)
 	if err != nil {
 		return err
 	}
@@ -138,23 +159,27 @@ func serve(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	defer st.Close()
-	if err := st.Migrate(ctx); err != nil {
+	if err := prepareSchema(ctx, st, cfg.MigrateOnStart); err != nil {
 		return err
 	}
 
-	jwt, err := identity.NewKeycloakVerifier(ctx, cfg.KeycloakIssuer, cfg.UsernameClaim, hc)
+	jwt, err := identity.NewKeycloakVerifier(ctx, cfg.KeycloakIssuer, cfg.UsernameClaim, cfg.GroupsClaim, hc)
 	if err != nil {
 		return err
 	}
 	login, err := web.NewKeycloakLogin(ctx, cfg.KeycloakIssuer, cfg.KeycloakWebClientID, cfg.KeycloakWebClientSecret,
-		cfg.PublicURL+"/login/callback", cfg.UsernameClaim, cfg.UsernameStripDomain, hc)
+		cfg.PublicURL+"/login/callback", cfg.UsernameClaim, cfg.UsernameStripDomain, cfg.RequiredGroup, cfg.GroupsClaim, hc)
 	if err != nil {
 		return err
 	}
 
 	oauth := map[store.Provider]*atlassian.OAuthProvider{}
 	connectors := map[store.Provider]web.Connector{}
-	svc := &tools.Service{PublicURL: cfg.PublicURL}
+	svc := &tools.Service{
+		PublicURL: cfg.PublicURL,
+		Spaces:    scope.Parse(cfg.Confluence.Allowed),
+		Projects:  scope.Parse(cfg.Jira.Allowed),
+	}
 	if p := cfg.Confluence; p.Enabled() {
 		c, err := confluence.NewClient(p.BaseURL, hc, cfg.MaxSearchResults, cfg.MaxContentChars)
 		if err != nil {
@@ -198,10 +223,11 @@ func serve(ctx context.Context, log *slog.Logger) error {
 	resolver := &identity.Resolver{
 		JWT: jwt, Keys: st, Agents: st,
 		UserClients: cfg.KeycloakUserClients, StripDomain: cfg.UsernameStripDomain, Log: log,
+		RequiredGroup: cfg.RequiredGroup, DisableAPIKeys: !cfg.EnableAPIKeys, DisableAgents: !cfg.EnableAgents,
 	}
 	webHandler, err := web.New(web.Config{
 		PublicURL: cfg.PublicURL, SessionKey: cfg.SessionKey, SessionTTL: cfg.SessionTTL,
-		APIKeyDefault: cfg.APIKeyDefaultTTL, APIKeyMax: cfg.APIKeyMaxTTL,
+		APIKeyDefault: cfg.APIKeyDefaultTTL, APIKeyMax: cfg.APIKeyMaxTTL, DisableAPIKeys: !cfg.EnableAPIKeys,
 		Login: login, Connectors: connectors, Grants: creds, Tokens: st, Keys: st, Log: log,
 	})
 	if err != nil {
@@ -215,14 +241,16 @@ func serve(ctx context.Context, log *slog.Logger) error {
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      2*cfg.HTTPTimeout + 10*time.Second,
 		IdleTimeout:       2 * time.Minute,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
 	}
 	metricsSrv := &http.Server{Addr: cfg.MetricsAddr, Handler: reg, ReadHeaderTimeout: 5 * time.Second}
 
 	errc := make(chan error, 2)
-	go func() { errc <- listen(app) }()
-	go func() { errc <- listen(metricsSrv) }()
-	log.Info("started", "version", version, "listen", cfg.ListenAddr, "metrics", cfg.MetricsAddr,
-		"confluence", cfg.Confluence.Enabled(), "jira", cfg.Jira.Enabled())
+	go func() { errc <- listen(app, cfg.TLSCertFile, cfg.TLSKeyFile) }()
+	go func() { errc <- listen(metricsSrv, "", "") }()
+	log.Info("started", "version", version, "listen", cfg.ListenAddr, "tls", cfg.TLSCertFile != "", "metrics", cfg.MetricsAddr,
+		"confluence_spaces", svc.Spaces.String(), "jira_projects", svc.Projects.String(),
+		"required_group", cfg.RequiredGroup, "api_keys", cfg.EnableAPIKeys, "agents", cfg.EnableAgents)
 
 	select {
 	case <-ctx.Done():
@@ -235,8 +263,15 @@ func serve(ctx context.Context, log *slog.Logger) error {
 	return errors.Join(app.Shutdown(shutdownCtx), metricsSrv.Shutdown(shutdownCtx))
 }
 
-func listen(s *http.Server) error {
-	if err := s.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+// listen serves HTTPS when a certificate is configured, plain HTTP otherwise.
+func listen(s *http.Server, certFile, keyFile string) error {
+	var err error
+	if certFile != "" {
+		err = s.ListenAndServeTLS(certFile, keyFile)
+	} else {
+		err = s.ListenAndServe()
+	}
+	if !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
@@ -261,7 +296,7 @@ func userCmd(ctx context.Context, args []string, stdout io.Writer) error {
 		return err
 	}
 	defer st.Close()
-	if err := st.Migrate(ctx); err != nil {
+	if err := prepareSchema(ctx, st, cfg.MigrateOnStart); err != nil {
 		return err
 	}
 	return runUserCmd(ctx, st, args, stdout, time.Now())
@@ -319,7 +354,7 @@ func agentCmd(ctx context.Context, args []string, stdin io.Reader, stdout io.Wri
 		return err
 	}
 	defer st.Close()
-	if err := st.Migrate(ctx); err != nil {
+	if err := prepareSchema(ctx, st, cfg.MigrateOnStart); err != nil {
 		return err
 	}
 	return runAgentCmd(ctx, st, args, stdin, stdout)

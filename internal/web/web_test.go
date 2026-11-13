@@ -28,6 +28,7 @@ var now = time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
 // fakeLogin emulates Keycloak: it remembers the parameters of the last authorize call.
 type fakeLogin struct {
 	user                   string
+	forbidden              bool // user outside the required group
 	state, nonce, verifier string
 }
 
@@ -39,6 +40,9 @@ func (f *fakeLogin) AuthCodeURL(state, nonce, verifier string) string {
 func (f *fakeLogin) Exchange(_ context.Context, code, verifier, nonce string) (string, error) {
 	if code != "kc-code" || verifier != f.verifier || nonce != f.nonce {
 		return "", errors.New("bad exchange")
+	}
+	if f.forbidden {
+		return "", identity.ErrForbidden
 	}
 	return f.user, nil
 }
@@ -86,8 +90,13 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
+	return newEnvWith(t, func(*Config) {})
+}
+
+func newEnvWith(t *testing.T, mutate func(*Config)) *env {
+	t.Helper()
 	e := &env{login: &fakeLogin{user: "alice"}, conf: &fakeConnector{atlassian: "Alice"}, st: memory.New()}
-	h, err := New(Config{
+	cfg := Config{
 		PublicURL:     "http://mcp.example",
 		SessionKey:    bytes.Repeat([]byte{9}, 32),
 		SessionTTL:    8 * time.Hour,
@@ -100,7 +109,9 @@ func newEnv(t *testing.T) *env {
 		Keys:          e.st,
 		Log:           slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Now:           func() time.Time { return now },
-	})
+	}
+	mutate(&cfg)
+	h, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,5 +400,33 @@ func TestTamperedSessionRejected(t *testing.T) {
 	c.Jar.SetCookies(u, []*http.Cookie{{Name: sessionCookie, Value: "forged"}})
 	if r := e.get(t, c, "/"); r.StatusCode != http.StatusFound {
 		t.Fatalf("forged session accepted: %d", r.StatusCode)
+	}
+}
+
+func TestLoginOutsidePilotGroup(t *testing.T) {
+	e := newEnv(t)
+	e.login.forbidden = true
+	e.get(t, e.c, "/login")
+	r := e.get(t, e.c, "/login/callback?code=kc-code&state="+url.QueryEscape(e.login.state))
+	if r.StatusCode != http.StatusForbidden || !strings.Contains(body(t, r), "участникам пилота") {
+		t.Fatalf("callback for non-member: %d", r.StatusCode)
+	}
+	if r := e.get(t, e.c, "/"); r.StatusCode != http.StatusFound {
+		t.Fatalf("non-member got a session: %d", r.StatusCode)
+	}
+}
+
+func TestAPIKeysDisabled(t *testing.T) {
+	e := newEnvWith(t, func(c *Config) { c.DisableAPIKeys = true })
+	e.signIn(t, e.c)
+	token := e.csrf(t, e.c)
+	if page := body(t, e.get(t, e.c, "/")); strings.Contains(page, "Ключи для агентов") || strings.Contains(page, `action="/keys"`) {
+		t.Fatal("keys section shown while keys are disabled")
+	}
+	if r := e.post(t, e.c, "/keys", url.Values{"csrf": {token}, "name": {"x"}}); r.StatusCode != http.StatusNotFound {
+		t.Fatalf("key issued while disabled: %d", r.StatusCode)
+	}
+	if keys, _ := e.st.ListAPIKeys(context.Background(), "alice"); len(keys) != 0 {
+		t.Fatalf("keys stored: %v", keys)
 	}
 }

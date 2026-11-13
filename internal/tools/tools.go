@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -16,6 +17,7 @@ import (
 	"atlassian-mcp/internal/atlassian/jira"
 	"atlassian-mcp/internal/identity"
 	"atlassian-mcp/internal/metrics"
+	"atlassian-mcp/internal/scope"
 	"atlassian-mcp/internal/store"
 )
 
@@ -62,9 +64,13 @@ func NewMetrics(r *metrics.Registry) *Metrics {
 }
 
 // Service holds tool dependencies. Confluence or Jira may be nil when disabled.
+// Spaces and Projects are the approved Confluence spaces and Jira projects;
+// their zero value allows nothing.
 type Service struct {
 	Confluence ConfluenceAPI
 	Jira       JiraAPI
+	Spaces     scope.Set
+	Projects   scope.Set
 	Creds      CredentialSource
 	Audit      Auditor
 	Limiter    RateLimiter
@@ -82,7 +88,12 @@ const (
 	statusNotConnected = "not_connected"
 	statusRateLimited  = "rate_limited"
 	statusUnauth       = "unauthenticated"
+	statusOutOfScope   = "out_of_scope"
 )
+
+// errOutOfScope marks an object outside the approved spaces or projects.
+// The model sees the same message as for a missing object.
+var errOutOfScope = errors.New("object outside the approved scope")
 
 // Register adds the enabled tools to server.
 func (s *Service) Register(server *mcp.Server) {
@@ -93,28 +104,36 @@ func (s *Service) Register(server *mcp.Server) {
 				"By default every word must occur (any order); use mode=phrase for an exact phrase. " +
 				"Filter by space keys, author username (e.g. i.ivanov) or modification date. " +
 				"Use the person's name exactly as given; never invent a patronymic. " +
-				"Returns titles, excerpts and links; call confluence_get_page to read a page.",
+				"Returns titles, excerpts and links; call confluence_get_page to read a page." + s.Spaces.Describe("spaces"),
 			Annotations: readOnly("Search Confluence"),
 		}, s.confluenceSearch)
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "confluence_get_page",
-			Description: "Read a Confluence page by numeric ID or by its URL. Returns the page as Markdown with metadata and link.",
+			Description: "Read a Confluence page by numeric ID or by its URL. Returns the page as Markdown with metadata and link." + s.Spaces.Describe("spaces"),
 			Annotations: readOnly("Read Confluence page"),
 		}, s.confluenceGetPage)
 	}
 	if s.Jira != nil {
 		mcp.AddTool(server, &mcp.Tool{
-			Name: "jira_search",
-			Description: "Search Jira issues the current user is allowed to see. Use structured filters " +
-				"(text, projects, statuses, assignee — 'me' for the current user, updated_after) or a raw JQL query, not both.",
+			Name:        "jira_search",
+			Description: s.jiraSearchDescription(),
 			Annotations: readOnly("Search Jira"),
 		}, s.jiraSearch)
 		mcp.AddTool(server, &mcp.Tool{
 			Name:        "jira_get_issue",
-			Description: "Read a Jira issue by key (e.g. OD-123): summary, status, people, description and the latest comments.",
+			Description: "Read a Jira issue by key (e.g. OD-123): summary, status, people, description and the latest comments." + s.Projects.Describe("projects"),
 			Annotations: readOnly("Read Jira issue"),
 		}, s.jiraGetIssue)
 	}
+}
+
+func (s *Service) jiraSearchDescription() string {
+	d := "Search Jira issues the current user is allowed to see. Use structured filters " +
+		"(text, projects, statuses, assignee — 'me' for the current user, updated_after)"
+	if s.Projects.Unrestricted() {
+		return d + " or a raw JQL query, not both."
+	}
+	return d + ". Raw JQL is not available." + s.Projects.Describe("projects")
 }
 
 func readOnly(title string) *mcp.ToolAnnotations {
@@ -139,18 +158,29 @@ type ConfluenceSearchOutput struct {
 }
 
 func (s *Service) confluenceSearch(ctx context.Context, req *mcp.CallToolRequest, in ConfluenceSearchInput) (*mcp.CallToolResult, ConfluenceSearchOutput, error) {
-	var out ConfluenceSearchOutput
-	err := s.run(ctx, req, "confluence_search", store.Confluence, in, func(auth atlassian.Auth) (int, error) {
+	out := ConfluenceSearchOutput{Results: []confluence.SearchResult{}}
+	err := s.run(ctx, req, "confluence_search", store.Confluence, in, func(auth atlassian.Auth) ([]string, error) {
 		after, err := atlassian.ParseDate(in.ModifiedAfter)
 		if err != nil {
-			return 0, err
+			return nil, err
+		}
+		spaces, err := s.Spaces.Restrict(in.Spaces, "spaces")
+		if err != nil {
+			return nil, err
 		}
 		res, err := s.Confluence.Search(ctx, auth, confluence.SearchParams{
-			Query: in.Query, Mode: confluence.Mode(in.Mode), Spaces: in.Spaces, Author: in.Author,
+			Query: in.Query, Mode: confluence.Mode(in.Mode), Spaces: spaces, Author: in.Author,
 			ModifiedAfter: after, TitleOnly: in.TitleOnly, Limit: in.Limit,
 		})
-		out.Results = res
-		return len(res), err
+		// Defence in depth: never pass on a result outside the approved spaces.
+		var ids []string
+		for _, r := range res {
+			if s.Spaces.Allows(r.Space) {
+				out.Results = append(out.Results, r)
+				ids = append(ids, r.ID)
+			}
+		}
+		return ids, err
 	})
 	return nil, out, err
 }
@@ -161,10 +191,16 @@ type ConfluenceGetPageInput struct {
 
 func (s *Service) confluenceGetPage(ctx context.Context, req *mcp.CallToolRequest, in ConfluenceGetPageInput) (*mcp.CallToolResult, *confluence.Page, error) {
 	var out *confluence.Page
-	err := s.run(ctx, req, "confluence_get_page", store.Confluence, in, func(auth atlassian.Auth) (int, error) {
+	err := s.run(ctx, req, "confluence_get_page", store.Confluence, in, func(auth atlassian.Auth) ([]string, error) {
 		p, err := s.Confluence.GetPage(ctx, auth, in.Page)
+		if err != nil {
+			return nil, err
+		}
+		if !s.Spaces.Allows(p.Space) {
+			return []string{p.ID}, errOutOfScope
+		}
 		out = p
-		return boolToInt(p != nil), err
+		return []string{p.ID}, nil
 	})
 	return nil, out, err
 }
@@ -183,20 +219,37 @@ type JiraSearchInput struct {
 
 func (s *Service) jiraSearch(ctx context.Context, req *mcp.CallToolRequest, in JiraSearchInput) (*mcp.CallToolResult, *jira.SearchResult, error) {
 	var out *jira.SearchResult
-	err := s.run(ctx, req, "jira_search", store.Jira, in, func(auth atlassian.Auth) (int, error) {
+	err := s.run(ctx, req, "jira_search", store.Jira, in, func(auth atlassian.Auth) ([]string, error) {
 		after, err := atlassian.ParseDate(in.UpdatedAfter)
 		if err != nil {
-			return 0, err
+			return nil, err
+		}
+		if strings.TrimSpace(in.JQL) != "" && !s.Projects.Unrestricted() {
+			// Arbitrary JQL could reach other projects; it is allowed only without a project allowlist.
+			return nil, atlassian.Invalid("raw jql is not available; use text, projects, statuses, assignee or updated_after")
+		}
+		projects, err := s.Projects.Restrict(in.Projects, "projects")
+		if err != nil {
+			return nil, err
 		}
 		res, err := s.Jira.Search(ctx, auth, jira.SearchParams{
-			Text: in.Text, JQL: in.JQL, Projects: in.Projects, Statuses: in.Statuses,
+			Text: in.Text, JQL: in.JQL, Projects: projects, Statuses: in.Statuses,
 			Assignee: in.Assignee, UpdatedAfter: after, Limit: in.Limit,
 		})
-		out = res
 		if res == nil {
-			return 0, err
+			return nil, err
 		}
-		return len(res.Issues), err
+		// Defence in depth: never pass on an issue outside the approved projects.
+		filtered := &jira.SearchResult{Total: res.Total, Issues: make([]jira.IssueSummary, 0, len(res.Issues))}
+		var keys []string
+		for _, is := range res.Issues {
+			if s.Projects.Allows(jira.ProjectOf(is.Key)) {
+				filtered.Issues = append(filtered.Issues, is)
+				keys = append(keys, is.Key)
+			}
+		}
+		out = filtered
+		return keys, err
 	})
 	return nil, out, err
 }
@@ -207,10 +260,22 @@ type JiraGetIssueInput struct {
 
 func (s *Service) jiraGetIssue(ctx context.Context, req *mcp.CallToolRequest, in JiraGetIssueInput) (*mcp.CallToolResult, *jira.Issue, error) {
 	var out *jira.Issue
-	err := s.run(ctx, req, "jira_get_issue", store.Jira, in, func(auth atlassian.Auth) (int, error) {
-		is, err := s.Jira.GetIssue(ctx, auth, in.Key)
+	err := s.run(ctx, req, "jira_get_issue", store.Jira, in, func(auth atlassian.Auth) ([]string, error) {
+		key := strings.ToUpper(strings.TrimSpace(in.Key))
+		// Checked before the request, so a project outside the scope is never queried.
+		if !s.Projects.Allows(jira.ProjectOf(key)) {
+			return []string{key}, errOutOfScope
+		}
+		is, err := s.Jira.GetIssue(ctx, auth, key)
+		if err != nil {
+			return nil, err
+		}
+		// A moved issue is returned under its new key, possibly in another project.
+		if !s.Projects.Allows(jira.ProjectOf(is.Key)) {
+			return []string{key, is.Key}, errOutOfScope
+		}
 		out = is
-		return boolToInt(is != nil), err
+		return []string{is.Key}, nil
 	})
 	return nil, out, err
 }
@@ -218,9 +283,10 @@ func (s *Service) jiraGetIssue(ctx context.Context, req *mcp.CallToolRequest, in
 // --- shared execution path ---
 
 // run authenticates, rate-limits, resolves credentials, calls fn, then audits.
+// fn returns the IDs of the objects it found or opened; they go to the audit log.
 // The returned error is shown to the model, so it is always user-facing and secret-free.
 func (s *Service) run(ctx context.Context, req *mcp.CallToolRequest, tool string, p store.Provider, params any,
-	fn func(atlassian.Auth) (results int, err error)) error {
+	fn func(atlassian.Auth) (objects []string, err error)) error {
 	start := s.now()
 
 	subject, ok := identity.Subject{}, false
@@ -228,8 +294,11 @@ func (s *Service) run(ctx context.Context, req *mcp.CallToolRequest, tool string
 		subject, ok = identity.SubjectFromTokenInfo(req.Extra.TokenInfo)
 	}
 	entry := &store.AuditEntry{Time: start, Tool: tool, Params: marshalParams(params)}
-	finish := func(status string, results int, err error) error {
-		entry.Status, entry.Results = status, results
+	finish := func(status string, objects []string, err error) error {
+		entry.Status, entry.Objects = status, objects
+		if status == statusOK {
+			entry.Results = len(objects)
+		}
 		entry.DurationMS = s.now().Sub(start).Milliseconds()
 		if err != nil {
 			entry.Error = truncate(err.Error(), 500)
@@ -241,61 +310,66 @@ func (s *Service) run(ctx context.Context, req *mcp.CallToolRequest, tool string
 	}
 
 	if !ok {
-		return finish(statusUnauth, 0, errors.New("не удалось определить пользователя"))
+		return finish(statusUnauth, nil, errors.New("не удалось определить пользователя"))
 	}
 	entry.SubjectKind, entry.Principal, entry.KeyID = string(subject.Kind), subject.Principal(), subject.KeyID
 
 	if !s.Limiter.Allow(subject.Principal()) {
-		return finish(statusRateLimited, 0, errors.New("слишком много запросов, повторите через минуту"))
+		return finish(statusRateLimited, nil, errors.New("слишком много запросов, повторите через минуту"))
 	}
 
 	auth, err := s.Creds.Auth(ctx, subject, p)
 	if err != nil {
-		return finish(s.classifyCredErr(err, p))
+		status, err := s.classifyCredErr(err, p)
+		return finish(status, nil, err)
 	}
 
-	results, err := fn(auth)
+	objects, err := fn(auth)
 	if err == nil {
-		return finish(statusOK, results, nil)
+		return finish(statusOK, objects, nil)
 	}
 	if errors.Is(err, atlassian.ErrUnauthorized) {
 		// The product rejected a token we believed valid: drop it and ask to reconnect.
 		_ = s.Creds.Invalidate(ctx, subject, p)
-		return finish(s.classifyCredErr(atlassian.ErrNotConnected, p))
+		status, err := s.classifyCredErr(atlassian.ErrNotConnected, p)
+		return finish(status, nil, err)
 	}
-	return finish(classifyCallErr(err, p))
+	status, err := classifyCallErr(err, p)
+	return finish(status, objects, err)
 }
 
-func (s *Service) classifyCredErr(err error, p store.Provider) (string, int, error) {
+func (s *Service) classifyCredErr(err error, p store.Provider) (string, error) {
 	switch {
 	case errors.Is(err, atlassian.ErrNotConnected):
-		return statusNotConnected, 0, fmt.Errorf(
+		return statusNotConnected, fmt.Errorf(
 			"доступ к %s не подключён. Попросите пользователя открыть %s/connect/%s и разрешить доступ, затем повторите запрос",
 			p.Title(), s.PublicURL, p)
 	case errors.Is(err, atlassian.ErrNoAgentAccess):
-		return statusNotConnected, 0, fmt.Errorf("агенту не выдан доступ к %s", p.Title())
+		return statusNotConnected, fmt.Errorf("агенту не выдан доступ к %s", p.Title())
 	case errors.Is(err, atlassian.ErrUpstream):
-		return statusError, 0, fmt.Errorf("%s временно недоступен, повторите позже", p.Title())
+		return statusError, fmt.Errorf("%s временно недоступен, повторите позже", p.Title())
 	default:
-		return statusError, 0, errors.New("внутренняя ошибка при получении доступа")
+		return statusError, errors.New("внутренняя ошибка при получении доступа")
 	}
 }
 
-func classifyCallErr(err error, p store.Provider) (string, int, error) {
+func classifyCallErr(err error, p store.Provider) (string, error) {
 	var apiErr *atlassian.APIError
 	switch {
+	case errors.Is(err, errOutOfScope):
+		return statusOutOfScope, fmt.Errorf("не найдено в %s или нет прав доступа", p.Title())
 	case errors.Is(err, atlassian.ErrInvalidParams):
-		return statusInvalid, 0, err
+		return statusInvalid, err
 	case errors.Is(err, atlassian.ErrNotFound):
-		return statusNotFound, 0, fmt.Errorf("не найдено в %s или нет прав доступа", p.Title())
+		return statusNotFound, fmt.Errorf("не найдено в %s или нет прав доступа", p.Title())
 	case errors.Is(err, atlassian.ErrBadRequest) && errors.As(err, &apiErr) && apiErr.Message != "":
-		return statusInvalid, 0, fmt.Errorf("%s отклонил запрос: %s", p.Title(), apiErr.Message)
+		return statusInvalid, fmt.Errorf("%s отклонил запрос: %s", p.Title(), apiErr.Message)
 	case errors.Is(err, atlassian.ErrBadRequest):
-		return statusInvalid, 0, fmt.Errorf("%s отклонил запрос", p.Title())
+		return statusInvalid, fmt.Errorf("%s отклонил запрос", p.Title())
 	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
-		return statusError, 0, fmt.Errorf("%s не ответил вовремя", p.Title())
+		return statusError, fmt.Errorf("%s не ответил вовремя", p.Title())
 	default:
-		return statusError, 0, fmt.Errorf("ошибка обращения к %s, повторите позже", p.Title())
+		return statusError, fmt.Errorf("ошибка обращения к %s, повторите позже", p.Title())
 	}
 }
 
@@ -312,13 +386,6 @@ func marshalParams(v any) json.RawMessage {
 		return json.RawMessage(`{}`)
 	}
 	return b
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 func truncate(s string, n int) string {

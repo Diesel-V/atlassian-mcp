@@ -73,6 +73,7 @@
     {{end}}
   </section>
 
+  {{if .KeysEnabled}}
   <section>
     <h2>Ключи для агентов</h2>
     <p class="muted">Для OpenCode и своих скриптов. Адрес MCP-сервера: <code>{{.MCPURL}}</code>, ключ передаётся в заголовке <code>Authorization: Bearer &lt;ключ&gt;</code>.</p>
@@ -99,6 +100,7 @@
       <button class="primary" type="submit">Создать ключ</button>
     </form>
   </section>
+  {{end}}
 </main>
 </body>
 </html>

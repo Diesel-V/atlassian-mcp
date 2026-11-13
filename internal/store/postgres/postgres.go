@@ -103,6 +103,47 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return nil
 }
 
+// ErrSchemaOutdated means migrations are pending; run "atlassian-mcp migrate" as the schema owner.
+var ErrSchemaOutdated = errors.New("postgres: schema is not up to date, run migrations")
+
+// CheckSchema verifies that every embedded migration has been applied. It is used
+// when the service runs under a role that may not change the schema.
+func (s *Store) CheckSchema(ctx context.Context) error {
+	latest, err := latestMigration()
+	if err != nil {
+		return err
+	}
+	var current int
+	err = s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&current)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" { // undefined_table: never migrated
+		return fmt.Errorf("%w (no schema)", ErrSchemaOutdated)
+	}
+	if err != nil {
+		return err
+	}
+	if current < latest {
+		return fmt.Errorf("%w (at %d, need %d)", ErrSchemaOutdated, current, latest)
+	}
+	return nil
+}
+
+func latestMigration() (int, error) {
+	files, err := fs.Glob(migrationsFS, "migrations/*.sql")
+	if err != nil {
+		return 0, err
+	}
+	latest := 0
+	for _, f := range files {
+		v, err := strconv.Atoi(strings.SplitN(strings.TrimPrefix(f, "migrations/"), "_", 2)[0])
+		if err != nil {
+			return 0, fmt.Errorf("postgres: bad migration name %q", f)
+		}
+		latest = max(latest, v)
+	}
+	return latest, nil
+}
+
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 func (s *Store) Close()                         { s.pool.Close() }
 
@@ -319,9 +360,9 @@ func (s *Store) InsertAudit(ctx context.Context, e *store.AuditEntry) error {
 		params = json.RawMessage(`{}`)
 	}
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO audit_log (ts, subject_kind, principal, key_id, tool, params, results, status, duration_ms, error)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		e.Time, e.SubjectKind, e.Principal, e.KeyID, e.Tool, []byte(params), e.Results, e.Status, e.DurationMS, e.Error)
+		INSERT INTO audit_log (ts, subject_kind, principal, key_id, tool, params, objects, results, status, duration_ms, error)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		e.Time, e.SubjectKind, e.Principal, e.KeyID, e.Tool, []byte(params), objects(e.Objects), e.Results, e.Status, e.DurationMS, e.Error)
 	return err
 }
 
@@ -331,4 +372,12 @@ func (s *Store) PurgeAudit(ctx context.Context, before time.Time) (int64, error)
 		return 0, err
 	}
 	return tag.RowsAffected(), nil
+}
+
+// objects never writes NULL, so the column can be searched with = ANY without COALESCE.
+func objects(ids []string) []string {
+	if ids == nil {
+		return []string{}
+	}
+	return ids
 }

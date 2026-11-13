@@ -195,7 +195,9 @@ func (s *Store) ListAgents(_ context.Context) ([]*store.Agent, error) {
 func (s *Store) InsertAudit(_ context.Context, e *store.AuditEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.audit = append(s.audit, *e)
+	c := *e
+	c.Objects = slices.Clone(e.Objects)
+	s.audit = append(s.audit, c)
 	return nil
 }
 
