@@ -2,6 +2,8 @@
 # Required CI/CD variables (project or group level):
 #   GOPROXY          internal Go module proxy (public repositories are closed)
 #   REGISTRY_IMAGE   image name in the internal registry, defaults to $CI_REGISTRY_IMAGE
+#   REGISTRY_HOST / REGISTRY_USER / REGISTRY_PASSWORD
+#                    push credentials; default to the GitLab registry of the project
 #   IMAGE_MIRROR     prefix of the internal mirror for base images, e.g. registry-proxy.example.com/
 # Deployment is a separate decision (see docs: open question "who deploys after sudo is revoked").
 
@@ -10,6 +12,9 @@ stages: [lint, test, scan, build, image-scan]
 variables:
   GO_IMAGE: ${IMAGE_MIRROR}golang:1.25
   REGISTRY_IMAGE: ${CI_REGISTRY_IMAGE}
+  REGISTRY_HOST: ${CI_REGISTRY}
+  REGISTRY_USER: ${CI_REGISTRY_USER}
+  REGISTRY_PASSWORD: ${CI_REGISTRY_PASSWORD}
   IMAGE_TAG: ${CI_COMMIT_SHORT_SHA}
   GOFLAGS: -mod=mod
   GOCACHE: ${CI_PROJECT_DIR}/.cache/go-build
@@ -55,6 +60,8 @@ build-image:
     entrypoint: [""]
   cache: {}
   script:
+    - mkdir -p /kaniko/.docker
+    - printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY_HOST" "$(printf '%s:%s' "$REGISTRY_USER" "$REGISTRY_PASSWORD" | base64 | tr -d '\n')" > /kaniko/.docker/config.json
     - |
       DEST="--destination ${REGISTRY_IMAGE}:${IMAGE_TAG}"
       if [ -n "$CI_COMMIT_TAG" ]; then DEST="$DEST --destination ${REGISTRY_IMAGE}:${CI_COMMIT_TAG}"; fi
@@ -73,6 +80,9 @@ trivy:
     name: ${IMAGE_MIRROR}aquasec/trivy:0.58.1
     entrypoint: [""]
   cache: {}
+  variables:
+    TRIVY_USERNAME: ${REGISTRY_USER}
+    TRIVY_PASSWORD: ${REGISTRY_PASSWORD}
   script:
     - trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "${REGISTRY_IMAGE}:${IMAGE_TAG}"
   rules:
