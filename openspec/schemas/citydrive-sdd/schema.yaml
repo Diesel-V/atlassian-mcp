@@ -1,0 +1,217 @@
+name: citydrive-sdd
+# История версий и правила ревью артефактов старых версий — README, раздел «История схемы citydrive-sdd».
+# Комментарии этого файла модель не видит: всё, что должно влиять на генерацию, — в `instruction`.
+# v6: D<N> — только принятый выбор (трассировка FR/TR через Goals или D); «Отклонено» опционально;
+#     «Почему» — только почему выбрано, контракт «каким» — в условных секциях.
+# v7: AC со сценарием — только имя сценария (capability/Requirement уже в ссылке FR, не повторяются);
+#     ссылочная форма допустима и для TR, если проверка совпадает со сценарием delta.
+# v8: из change.md убраны «Бизнес-логика» (поведение — в delta) и «Решения для review» (решения и отклонённые
+#     альтернативы — в design.md D<N>); однотипные сценарии одной FR без различимых ветвей — одной строкой AC.
+#     Артефакты v6/v7 и design.md со ссылками на убранные разделы остаются валидными.
+# v9: «Что меняем» — только наблюдаемый эффект, без механики и имён конфиг-ключей/полей/методов (они в Impact/Scope);
+#     FR — строго одна строка без перечисления конфиг-ключей; бюджет change.md — ориентир ~70 строк, повторы секций убирать.
+# v10: «Ошибки», «Риски / Trade-offs», «Security / Compliance», «Открытые вопросы» в design.md — условные по содержимому
+#     (пусто — секции нет), как API/БД с v5; обязательные — Context, Goals / Non-Goals, Decisions.
+#     design.md v9 с секциями-«нет» остаётся валидным.
+# v11: «Ограничения», «Проверка QA» в change.md — условные по содержимому (пусто — секции нет, как в design.md с v10);
+#     «Открытые вопросы» убраны из change.md и design.md — эскалируются человеку (вопрос до записи / допущение),
+#     запаркованный в документе вопрос можно пропустить; гейт implement по вопросам убран (остался гейт по рискам).
+#     Остальные секции change.md обязательны, пустая — «нет». Артефакты v10 остаются валидными.
+#     design.md — бюджет-ориентир ~150 строк (как ~70 у change.md): не влезает — сигнал делить change.
+version: 11
+description: Citydrive SDD — change (what/why) → specs (delta) → design (how) → tasks (plan); baseline is updated after merge via /sdd-apply
+artifacts:
+  - id: change
+    generates: change.md
+    description: What and why we change — type, scope, impact, FR/TR, constraints, AC, QA check
+    template: change.md
+    instruction: |
+      Record WHAT and WHY we are changing — input for review and QA, not an implementation plan.
+
+      Language: Russian for the document body. Format: strictly per the template. A required section that is empty — «нет»;
+      content-conditional sections (Ограничения, Проверка QA) — nothing to write → no section.
+      Rules:
+      - Keep the document compact (target — up to ~70 lines): theses, not paragraphs; the same thought repeated in
+        neighboring sections is a signal to drop the duplicate (see "one fact — one section" below).
+      - Type (required): feature | bugfix | refactor | tech-debt.
+        feature/bugfix → FR required, TR as needed, Capabilities new/modified.
+        refactor/tech-debt → behavior unchanged: TR only, FR «нет», Capabilities «не затрагиваются»,
+        no Проверка QA section.
+        Type ambiguous (behavior changes) — feature or bugfix, not refactor.
+      - «Что меняем» — 2–5 observable changes, one line each; breaking ones — **BREAKING**.
+        Only THIS change's effect, no mechanics: do not list config keys, fields and method names —
+        they belong in Impact/Scope. An effect depending on another repository/team (their code, deploy —
+        outside Impact) — mark «доступно после <...>» and reflect the dependency in «Ограничениях».
+      - Capabilities — from `openspec list --specs` or new kebab-case; each modified/new → a delta spec.
+      - FR — a one-line summary of observable behavior + a delta reference:
+        `→ delta <capability> ADDED/MODIFIED «<Requirement title>»`; a BREAKING FR → reference the REMOVED.
+        Do not list config keys, fields and methods; the full requirement text and scenarios — only in the delta.
+      - TR — a verifiable technical property of the result, RFC 2119. How to implement — not here.
+        Pure tooling (mocks, generation, lint) — no delta reference (TR does not reach the baseline).
+      - AC:
+        - Covered by a delta scenario → the AC references the scenario by name, does not retell it:
+          `AC-N (FR-N) [kind]: «<Scenario>» — Проверка: <method>`.
+          Capability and Requirement are not repeated — they are already in the FR reference; Given/When/Then text — only in the delta.
+        - Scenarios of one FR with the same kind and method and no distinguishable branches — one AC line:
+          `AC-N (FR-N) [kind]: «<Scenario-1>», «<Scenario-2>» — Проверка: <method>`.
+        - Not covered by a scenario (TR, refactor/tech-debt, verification via another service, code review) —
+          the full form: `AC-N (FR-N|TR-N) [kind]: GIVEN … WHEN … THEN … — Проверка: <method>`.
+        kind — позитивный / негативный / граничный / регрессия;
+        method — unit service / repository-suite / transport / consumer / QA на стенде / CI-команда / ревью кода;
+        every FR/TR ≥1 AC; every AC ← an existing FR/TR (and an existing delta scenario);
+        distinguishable causes/branches (different codes, reason, description) → an AC for each;
+        an FR with errors/boundaries → ≥1 negative/boundary AC; bugfix → an AC reproducing the defect;
+        refactor/tech-debt → a regression AC ← baseline;
+        THEN — an observation point (API, event, DB, log, command), not internal variables.
+      - One fact — one section: the others reference it, they do not repeat its wording.
+        An AC does not repeat the capability/Requirement from the FR; «Ограничения» do not repeat «Что меняем» and Impact.
+        Code paths — only in Impact; `path:line` — only in «Источник»; «Scope» — semantic boundaries, no paths.
+      - «Impact» — the single list of what is touched (packages, gRPC methods, topics, DB, config, dependencies, tooling);
+        an untouched area — «не затрагивается».
+      - «Проверка QA» (conditional): for ACs with «QA на стенде» — the stand, preconditions, test data (no secrets),
+        observation points, the AC split between QA/autotests. No such ACs → no section
+        (the closing method of each AC is visible in its «Проверка»).
+      - «Ограничения» (conditional): API/data compatibility (from Impact), schema and topic rollback, security,
+        performance, assumptions. No unique facts beyond Impact and the delta → no section.
+      - An approval/decision of a specific person — with a source reference (Jira/Confluence/Slack) or a quote;
+        without a source — an assumption.
+      - Not confirmed by a source — **предположение** (assumption). A code/baseline/Confluence/Jira discrepancy or an ambiguity
+        affecting scope/behavior/compatibility — ask the human before writing; do not choose silently.
+        There is no «Открытые вопросы» section in change.md: a question parked in a document can be skipped.
+      - The document describes the current decision, not the edit history: no "Status" lines, "после /sdd-update",
+        "решение пользователя от …", "было/стало". When editing, the outdated is replaced, not appended.
+    requires: []
+
+  - id: specs
+    generates: "specs/**/*.md"
+    description: Delta specs for the touched capabilities — ADDED/MODIFIED/REMOVED/RENAMED requirements
+    template: spec.md
+    instruction: |
+      Delta specs: one file `specs/<capability>/spec.md` per new/modified capability from Scope.
+      Refactor/tech-debt (Capabilities «не затрагиваются») → skip this step.
+
+      Language: Russian for the document body. The file starts with `## Purpose` (new capability) or with the first
+      delta section — no H1, no preamble, no quotes retelling change.md. Delta operations are ## headings:
+
+      - **ADDED** — new behavior; the full requirement text and scenarios live here.
+        A new capability → `## Purpose` (50+ characters).
+      - **MODIFIED** — the requirement in full in its new wording; `### Requirement:` exactly as in the baseline (for sdd-apply).
+        Include ALL scenarios; a skipped scenario = a lost requirement.
+      - **REMOVED** — only the requirement heading from the baseline.
+      - **RENAMED** — `FROM: <old> → TO: <new>`; do not touch the content.
+
+      Rules:
+      - A requirement is observable behavior. Keywords — RFC 2119 only: MUST / MUST NOT / SHALL /
+        SHALL NOT / SHOULD / SHOULD NOT / MAY; not ONLY / NOT / NEVER in caps. Code/structure — not in requirements.
+      - Every `### Requirement` ≥1 `#### Scenario`: GIVEN (when needed), WHEN, THEN.
+        The scenario name is unique within the requirement: ACs from change.md reference it.
+      - THEN — an observation point (API, Kafka, DB, log), not internal variables.
+      - Errors and boundaries — as separate scenarios (negative/boundary ACs reference them).
+      - The capability path — `openspec list --specs` (modified) or kebab-case (new); a typo = a nonexistent capability.
+      - Not confirmed by a source — do not write. An empty delta section — do not write.
+      - Only the current decision: wording cancelled during an edit does not remain.
+    requires:
+      - change
+
+  - id: design
+    generates: design.md
+    description: How we implement — API, DB, integrations, errors, risks, testability, plan
+    template: design.md
+    instruction: |
+      Record HOW we implement, from the agreed change.md and delta specs.
+
+      Language: Russian for the document body. Format: per the template — headings and order unchanged.
+      Keep the document compact (target — up to ~150 lines): contracts as tables and DDL, no prose;
+      a fact repeated across sections is a signal to drop the duplicate. Does not fit — a signal to split the change, not to squeeze the meaning.
+      Required sections: Context, Goals / Non-Goals, Decisions.
+      Conditional per change.md Impact — API, Данные (БД), Интеграции (Kafka, Внешние сервисы), Мониторинг / Алерты
+      (monitoring — only when a metric or an alert is introduced).
+      Conditional by content — Ошибки, Риски / Trade-offs, Security / Compliance:
+      present only when there is something to record; otherwise no section — no heading, no «нет»/«Не затрагивается».
+      An empty table — «нет».
+      Template hints and placeholders do not remain in the document.
+
+      Rules:
+      - Traceability: every FR/TR — in the «Закрывает» of Goals or of at least one D<N>. A D<N> — only an accepted choice
+        (a real alternative was considered); a retelling of the FR/TR by the decision does not count; minor consequences of a decision
+        do not become a separate D<N>. The test for every AC and ERR is assigned by tasks.md, not design.
+      - «Ошибки»: every row — `ERR-N`. The error's behavior already exists as a delta scenario with an AC → the «Ситуации» cell
+        references `→ AC-K`; no separate test obligation. An ERR without an AC — verified by its own test.
+      - No separate section about tests: what to verify — the delta scenario; the level and QA — the AC in change.md; which test — tasks.md.
+        «Проверяемость» in D<N> — only when the mechanism is not obviously observable in a test (atomicity, ordering, absence of an effect)
+        or new test infrastructure is needed (a DB suite, fixtures); the scenario is not retold. A test tied to neither
+        an AC nor an ERR is not added — ask the human (needs /sdd-update).
+      - One fact — one place:
+        - «Что меняем», «Зачем», «Ограничения» — in change.md; behavior and scenarios — in the delta; here only references.
+          Decisions and rejected alternatives — only here (D<N>): there is no «Решения для review» or «Бизнес-логика» in change.md.
+        - Justification — only in D<N>; other sections reference D<N>. «Почему» in D<N> — why it was chosen (1–2 phrases);
+          the "what" contract (fields, DDL, payload) — in the conditional sections, not in D<N>. A value (timeout, retry,
+          log event, secret) occurs once. An alternative shared by several D<N> — once, then «см. D1».
+        - Tails of rejected alternatives (parameters of the rejected option) are not written.
+        - Conditional sections — contract only ("what"): fields, keys, payload, DDL, timeout/retry. What is touched
+          and the level (additive / BREAKING) — the change.md Impact; idempotency, retries, assumptions —
+          «Ограничения» and the delta. "No changes" rows are not written.
+      - Goals — design-level goals, not a retelling of FR/TR.
+      - «Ошибки» — only new and changed errors; unchanged ones that must be held by regression —
+        one line under the table.
+      - Risks — only real ones, with a mitigation and an owner: no filler rows and no repetition of change.md
+        assumptions. A D<N> with a simplification/shortcut affecting the correctness of the result — a risk row, not only
+        a note in D<N>. Status «закрыто» — only when the mitigation is done and confirmed (merged/deployed);
+        depending on an external team until their rollout — «принято»/«в работе» with a removal condition.
+      - **BREAKING** in change.md («Что меняем») and in design.md (API/Интеграции) — about the same contract;
+        a discrepancy without an explicit explanation — ask the human; do not choose silently.
+      - Paths and function names — yes; line numbers (`path:line`) — no.
+      - Reuse: first ports, repositories, mappers, transactions, outbox; something new — with a justification in D<N>.
+      - An external contract not confirmed by this repository's code or documentation — **предположение** (assumption)
+        with a source and a verification method.
+      - A question blocking behavior, a contract, the schema or compatibility — ask the human before writing; do not choose silently.
+        Design contradicts change → do not edit change.md; ask the human.
+        There is no «Открытые вопросы» section in design.md: a question parked in a document can be skipped.
+      - No separate rollout and rollback plan. A rollout order that correctness depends on (consumer before
+        producer, migration before code) — in D<N> and as a row in «Рисках».
+      - Protobuf and Kafka schemas — as separate lists. DB — migrations per entity, a DDL sketch, backfill, locks, rollback.
+      - Architecture per AGENTS.md: `models/` without external dependencies, dependencies point inward, external things via ports.
+      - The document describes the current decision, not the edit history: no "Status", "после /sdd-update",
+        "решение пользователя", "отклонено при ревью". When editing, the outdated is replaced.
+    requires:
+      - change
+
+  - id: tasks
+    generates: tasks.md
+    description: Implementation plan — atomic tasks with a check, by layer
+    template: tasks.md
+    instruction: |
+      Break the D<N> decisions from design.md into tasks by layer.
+
+      Format (for `openspec instructions apply`): `- [ ] X.Y <task>`, groups — `## N. <group>`.
+      Any other format is not tracked.
+
+      Rules:
+      - Task order — implementation order: proto → migrations/repository → models(types)/port → service → transport/DI;
+        a group `## N.` — a layer. Every D<N> is closed by at least one task.
+        No separate "Tests" group at the end: a test is part of the task of the layer whose behavior it verifies.
+      - Two kinds of tasks:
+        - **behavioral** (repository, service, transport, consumer, job) — implemented per TDD:
+          `X.Y <behavior> (D<N>; AC-K, ERR-N) — тест: <path>_test.go <TestName>; код: <path>; проверить: go test ./<pkg>/... -run <TestName>`.
+          The test is named before the code; one task — one observable behavior (1–3 AC/ERR).
+        - **structural** (proto, migration, logic-free models/port, generation, DI, config) — no test:
+          `X.Y <action> (D<N>) — проверить: <go build / generation diff / ...>`.
+      - Every AC with an autotest and every ERR without an AC (from design's «Ошибки») — in exactly one behavioral task; a behavioral task
+        without an AC/ERR is not added (ask the human — needs /sdd-update). An AC «QA на стенде» — an autotest when possible.
+        An AC with the check «ревью кода» / «CI-команда» — in the «проверить» of the task that implements it, not a separate task.
+      - AC and ERR — by number only, no retelling: what to verify — the delta scenario; how — D<N>.
+      - A task is atomic, 1–3 lines, concrete paths. Do not retell design: the "how" — a reference to D<N>.
+      - Generation (`make gen`, `go generate`) — a separate structural task after proto/ports, before the tasks that use it.
+      - Not `make test` (banned by AGENTS.md) → `go test ./path/...`.
+      - Design ambiguities affecting the tasks — resolve with the user first.
+    requires:
+      - design
+
+apply:
+  requires: [tasks]
+  tracks: tasks.md
+  instruction: |
+    Implement the tasks from tasks.md one at a time, in file order, per change.md and design.md.
+    A behavioral task — TDD: stub → the test fails on an assert (red) → minimal code (green) → refactor within the task.
+    A structural one — the change and the check from the task. After each — `- [ ]` → `- [x]`; wording unchanged.
+    A discrepancy with the plan — pause and /sdd-update, not an edit of change.md/design.md.

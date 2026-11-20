@@ -1,0 +1,6 @@
+schema: citydrive-sdd
+
+context: |
+  Go-сервис atlassian-mcp: MCP-сервер к Confluence/Jira DC от имени пользователя (Keycloak + OAuth Atlassian).
+  Артефакты пишутся на русском.
+  Требования ИБ пилота обязательны: allowlist пространств/проектов, только чтение, аудит без токенов и текста, секреты только через *_FILE.

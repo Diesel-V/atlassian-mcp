@@ -1,0 +1,19 @@
+name: minimalist
+version: 2
+description: Lightweight schema for well-scoped, low-risk changes
+artifacts:
+  - id: specs
+    generates: specs/**/*.md
+    description: Requirement deltas with user stories and named Given/When/Then scenarios, compatible with CLI validation and archive
+    template: specs/spec.md
+    requires: []
+  - id: tasks
+    generates: tasks.md
+    description: Implementation checklist with trackable tasks
+    template: tasks.md
+    requires:
+      - specs
+apply:
+  requires:
+    - tasks
+  tracks: tasks.md
